@@ -1,72 +1,143 @@
 import os
 import logging
-import threading
-from flask import Flask, jsonify
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from groq import Groq
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) # Put your Telegram ID here or in Render env vars
 
-@app.route('/')
-def home():
-    return jsonify({"status": "NetworkPulse Bot is live 🕊️"}), 200
+if not BOT_TOKEN or not GROQ_API_KEY:
+    raise ValueError("Missing BOT_TOKEN or GROQ_API_KEY in environment variables")
 
-@app.route('/health')
-def health():
-    return jsonify({"status": "ok"}), 200
+client = Groq(api_key=GROQ_API_KEY)
 
-# Init Groq
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# Storage - resets on restart. Use Postgres on Render for prod
+conversation_history = {}
+daily_count = {}
+PREMIUM_USERS = set() # Add IDs here: {123456789, 987654321}
+
+FREE_LIMIT = 20
+
+def is_premium(user_id):
+    return user_id in PREMIUM_USERS
+
+def get_daily_count(user_id):
+    return daily_count.get(user_id, 0)
+
+def increment_daily_count(user_id):
+    daily_count[user_id] = get_daily_count(user_id) + 1
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors and notify admin"""
+    logger.error("Exception while handling update:", exc_info=context.error)
+
+    error_msg = f"🔥 BOT ERROR\nUser: {update.effective_user.id if update else 'N/A'}\nError: {context.error}"
+
+    # Notify admin if set
+    if ADMIN_ID!= 0:
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=error_msg[:4000])
+        except:
+            pass
+
+    # Tell user something went wrong
+    if update and hasattr(update, 'message') and update.message:
+        await update.message.reply_text("Something broke on my end. I’ve notified the dev. Try again in 10 sec.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("NetworkPulse Bot alive 🕊️\nSend /ask your question to chat with AI.")
+    keyboard = [
+        [InlineKeyboardButton("💬 Chat with AI", callback_data="chat"),
+         InlineKeyboardButton("🌐 Network Tools", callback_data="tools")],
+        [InlineKeyboardButton("⭐ Upgrade to Premium", callback_data="upgrade")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("/start - Check if bot is alive\n/help - Show this message\n/ask [question] - Ask the AI anything")
+    await update.message.reply_text(
+        "Yo, I'm NetworkPulse AI.\n"
+        "Ask me anything about networking, code, or just chat.\n\n"
+        "Free: 20 msgs/day\nPremium: Unlimited + advanced tools",
+        reply_markup=reply_markup
+    )
 
-async def ask_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    question = " ".join(context.args)
-    if not question:
-        await update.message.reply_text("Usage: /ask what is AI?")
+async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⭐ Premium = Unlimited messages + 32k memory + advanced tools\n"
+        "Contact @your_username to upgrade. Manual for now.\n"
+        "Your Telegram ID: " + str(update.effective_user.id)
+    )
+
+async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_msg = update.message.text
+
+    # Check limits
+    if not is_premium(user_id) and get_daily_count(user_id) >= FREE_LIMIT:
+        await update.message.reply_text(
+            "Free limit reached 🚫\n"
+            "Hit /upgrade for unlimited access."
+        )
         return
-    
-    await update.message.reply_text("Thinking...")
-    
+
+    # Get history
+    history = conversation_history.get(user_id, [])
+    history.append({"role": "user", "content": user_msg})
+
+    # Keep last 8 for free, 16 for premium
+    max_history = 16 if is_premium(user_id) else 8
+    history = history[-max_history:]
+
+    # Choose model
+    model = "llama-3.3-70b-versatile" if is_premium(user_id) else "llama-3.1-8b-instant"
+
     try:
         response = client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
-            messages=[{"role": "user", "content": question}]
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are NetworkPulse AI. Helpful for network engineers and daily questions. Be direct, clear, no fluff."}
+            ] + history,
+            temperature=0.7,
+            max_tokens=800
         )
-        answer = response.choices[0].message.content
-        await update.message.reply_text(answer)
+
+        reply = response.choices[0].message.content
+        history.append({"role": "assistant", "content": reply})
+        conversation_history[user_id] = history
+        increment_daily_count(user_id)
+
+        await update.message.reply_text(reply)
+
     except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+        logger.error(f"Groq error for user {user_id}: {e}")
+        await update.message.reply_text("Groq dey sleep small. Try again now.")
+
+async def subnet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) == 0:
+        await update.message.reply_text("Usage: /subnet 192.168.1.0/24")
+        return
+    await update.message.reply_text("Subnet tool coming. For now ask: 'calculate subnet for 192.168.1.0/24'")
 
 def main():
-    BOT_TOKEN = os.environ.get("BOT_TOKEN")
-    logger.info(f"BOT_TOKEN loaded: {bool(BOT_TOKEN)}")
-    
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set!")
-        return
-    
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("ask", ask_handler))
-    
-    logger.info("NetworkPulse Bot alive 🕊️")
-    application.run_polling()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("upgrade", upgrade))
+    app.add_handler(CommandHandler("subnet", subnet_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
+
+    # Add global error handler
+    app.add_error_handler(error_handler)
+
+    logger.info("Bot starting...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    main() 
+    main()
