@@ -23,7 +23,7 @@ client = Groq(api_key=GROQ_API_KEY)
 # Storage - resets on restart. Use Postgres on Render for prod
 conversation_history = {}
 daily_count = {}
-PREMIUM_USERS = set{} # Add IDs here: {842917088, 987654321}
+PREMIUM_USERS = set{842917088} # Add IDs here:
 
 FREE_LIMIT = 20
 
