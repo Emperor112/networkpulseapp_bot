@@ -1,12 +1,9 @@
 import os
 import logging
 import threading
-import nest_asyncio
 from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-
-nest_asyncio.apply()  # Fix for Render + Python 3.14
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,7 +27,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"You said: {update.message.text}")
 
-async def main():
+def main():
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
     logger.info(f"BOT_TOKEN loaded: {bool(BOT_TOKEN)}")
     
@@ -44,7 +41,7 @@ async def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     
     logger.info("NetworkPulse Bot alive 🕊️")
-    await application.run_polling()
+    application.run_polling()
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -53,6 +50,4 @@ def run_flask():
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    
-    import asyncio
-    asyncio.run(main())
+    main()
