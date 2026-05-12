@@ -148,8 +148,8 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only your ID 12368493 can run this
-    if update.effective_user.id!= 12368493:
+    # Only your ID 8429170788 can run this
+    if update.effective_user.id!= 8429170788:
         await update.message.reply_text("Not for you bro 😂")
         return
 
@@ -221,7 +221,7 @@ application.add_handler(CommandHandler("setwallet", setwallet))
 application.add_handler(CommandHandler("node", node))
 application.add_handler(CommandHandler("earnings", earnings))
 application.add_handler(CommandHandler("upgrade", upgrade))
-application.add_handler(CommandHandler("setpremium", setpremium)) # <-- added here
+application.add_handler(CommandHandler("setpremium", setpremium))
 application.add_handler(PreCheckoutQueryHandler(precheckout))
 application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
