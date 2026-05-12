@@ -1,139 +1,165 @@
 import os
+import sqlite3
+import threading
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from flask import Flask
+from telegram import Update, LabeledPrice, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    PreCheckoutQueryHandler, ContextTypes, filters
+)
 from groq import Groq
 
-# Logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) # Put your Telegram ID here or in Render env vars
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+STAR_PRICE = int(os.getenv("STAR_PRICE", "300")) # 300 Stars = ~$4.20
 
 if not BOT_TOKEN or not GROQ_API_KEY:
-    raise ValueError("Missing BOT_TOKEN or GROQ_API_KEY in environment variables")
+    raise ValueError("Missing BOT_TOKEN or GROQ_API_KEY")
 
 client = Groq(api_key=GROQ_API_KEY)
 
-# Storage - resets on restart. Use Postgres on Render for prod
-conversation_history = {}
-daily_count = {}
-PREMIUM_USERS = {842917088} # Add IDs here:
+# --- SQLite DB ---
+conn = sqlite3.connect("bot.db", check_same_thread=False)
+cur = conn.cursor()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    is_premium INTEGER DEFAULT 0,
+    msg_count INTEGER DEFAULT 0,
+    last_reset TEXT DEFAULT CURRENT_DATE
+)
+""")
+conn.commit()
 
-FREE_LIMIT = 20
+def get_user(user_id):
+    cur.execute("SELECT * FROM users WHERE user_id =?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        return {"user_id": user_id, "is_premium": 0, "msg_count": 0}
+    return {"user_id": row[0], "is_premium": row[1], "msg_count": row[2]}
 
-def is_premium(user_id):
-    return user_id in PREMIUM_USERS
+def set_premium(user_id, status=1):
+    cur.execute("UPDATE users SET is_premium =? WHERE user_id =?", (status, user_id))
+    conn.commit()
 
-def get_daily_count(user_id):
-    return daily_count.get(user_id, 0)
+def increment_msg(user_id):
+    cur.execute("UPDATE users SET msg_count = msg_count + 1 WHERE user_id =?", (user_id,))
+    conn.commit()
 
-def increment_daily_count(user_id):
-    daily_count[user_id] = get_daily_count(user_id) + 1
+# --- Flask keep-alive ---
+app = Flask(__name__)
+@app.route('/')
+def home():
+    return "NetworkPulse AI alive"
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors and notify admin"""
-    logger.error("Exception while handling update:", exc_info=context.error)
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
-    error_msg = f"🔥 BOT ERROR\nUser: {update.effective_user.id if update else 'N/A'}\nError: {context.error}"
-
-    # Notify admin if set
-    if ADMIN_ID!= 0:
-        try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=error_msg[:4000])
-        except:
-            pass
-
-    # Tell user something went wrong
-    if update and hasattr(update, 'message') and update.message:
-        await update.message.reply_text("Something broke on my end. I’ve notified the dev. Try again in 10 sec.")
-
+# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("💬 Chat with AI", callback_data="chat"),
-         InlineKeyboardButton("🌐 Network Tools", callback_data="tools")],
+        [InlineKeyboardButton("💬 Chat with AI", callback_data="chat")],
         [InlineKeyboardButton("⭐ Upgrade to Premium", callback_data="upgrade")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(
-        "Yo, I'm NetworkPulse AI.\n"
-        "Ask me anything about networking, code, or just chat.\n\n"
-        "Free: 20 msgs/day\nPremium: Unlimited + advanced tools",
-        reply_markup=reply_markup
+        "Yo, I'm NetworkPulse AI 🤝\n\n"
+        "**Free**: 20 msgs/day, smart chat, basic tools\n"
+        "**Premium**: Unlimited, 32k memory, real-time tools, advanced moderation\n"
+        "Use /upgrade to unlock premium with Telegram Stars ✨",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⭐ Premium = Unlimited messages + 32k memory + advanced tools\n"
-        "Contact @your_username to upgrade. Manual for now.\n"
-        "Your Telegram ID: " + str(update.effective_user.id)
+    prices = [LabeledPrice("Premium Monthly", STAR_PRICE)]
+    await context.bot.send_invoice(
+        chat_id=update.effective_chat.id,
+        title="NetworkPulse Premium",
+        description="Unlimited chat, 32k memory, real-time tools, advanced moderation",
+        payload="premium_monthly",
+        provider_token="",
+        currency="XTR",
+        prices=prices
     )
+
+async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.pre_checkout_query.answer(ok=True)
+
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    set_premium(user_id, 1)
+    await update.message.reply_text("✅ Premium activated! You now have unlimited access.")
 
 async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_msg = update.message.text
+    user = get_user(user_id)
 
-    # Check limits
-    if not is_premium(user_id) and get_daily_count(user_id) >= FREE_LIMIT:
+    FREE_LIMIT = 20
+
+    # Check limit
+    if user["is_premium"] == 0 and user["msg_count"] >= FREE_LIMIT:
         await update.message.reply_text(
             "Free limit reached 🚫\n"
-            "Hit /upgrade for unlimited access."
+            "Hit /upgrade for unlimited access + premium features."
         )
         return
 
-    # Get history
-    history = conversation_history.get(user_id, [])
-    history.append({"role": "user", "content": user_msg})
+    increment_msg(user_id)
 
-    # Keep last 8 for free, 16 for premium
-    max_history = 16 if is_premium(user_id) else 8
-    history = history[-max_history:]
+    # Model selection
+    model = "llama-3.3-70b-versatile" if user["is_premium"] == 1 else "llama-3.1-8b-instant"
+    max_tokens = 1200 if user["is_premium"] == 1 else 600
 
-    # Choose model
-    model = "llama-3.3-70b-versatile" if is_premium(user_id) else "llama-3.1-8b-instant"
+    # System prompt
+    system_prompt = (
+        "You are NetworkPulse AI. Friendly, direct, helpful for network engineers and daily life questions. "
+        "No fluff. If premium, give detailed answers and use real-time context when possible."
+    )
 
     try:
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are NetworkPulse AI. Helpful for network engineers and daily questions. Be direct, clear, no fluff."}
-            ] + history,
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg}
+            ],
             temperature=0.7,
-            max_tokens=800
+            max_tokens=max_tokens
         )
 
         reply = response.choices[0].message.content
-        history.append({"role": "assistant", "content": reply})
-        conversation_history[user_id] = history
-        increment_daily_count(user_id)
-
         await update.message.reply_text(reply)
 
     except Exception as e:
-        logger.error(f"Groq error for user {user_id}: {e}")
-        await update.message.reply_text("Groq dey sleep small. Try again now.")
+        logger.error(f"Groq error: {e}")
+        await update.message.reply_text("Groq is sleeping small. Try again in 10s.")
 
-async def subnet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) == 0:
-        await update.message.reply_text("Usage: /subnet 192.168.1.0/24")
-        return
-    await update.message.reply_text("Subnet tool coming. For now ask: 'calculate subnet for 192.168.1.0/24'")
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Exception:", exc_info=context.error)
+    if ADMIN_ID!= 0:
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"Bot Error: {context.error}")
+        except:
+            pass
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Start Flask for UptimeRobot
+    threading.Thread(target=run_flask, daemon=True).start()
 
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("upgrade", upgrade))
-    app.add_handler(CommandHandler("subnet", subnet_cmd))
+    app.add_handler(PreCheckoutQueryHandler(precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
-
-    # Add global error handler
     app.add_error_handler(error_handler)
 
     logger.info("Bot starting...")
