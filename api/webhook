@@ -1,0 +1,233 @@
+import os
+import json
+import requests
+import time
+from http.server import BaseHTTPRequestHandler
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+OPENAI_API = "https://api.openai.com/v1/chat/completions"
+
+# Storage: {"pro": {chat_id: expiry_timestamp}, "free": {chat_id: {count, date}}}
+usage_store = {"pro": {}, "free": {}}
+
+SYSTEM_PROMPT = """You are Pulse Dev, a senior full-stack developer for DePIN and AI projects.
+Rules:
+1. Write clean, working code. No placeholders, no TODOs unless asked.
+2. Always include setup steps and requirements.txt if needed.
+3. If user asks to generate code, output the code in a ```language``` block and explain it briefly.
+4. Be direct. No fluff, no "As an AI".
+5. If code is over 40 lines, split into multiple files and list them.
+"""
+
+def send_message(chat_id, text):
+    requests.post(f"{TELEGRAM_API}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }, timeout=10)
+
+def send_invoice(chat_id, months):
+    price = months * 50
+    requests.post(f"{TELEGRAM_API}/createInvoiceLink", json={
+        "title": f"Pulse Dev Pro - {months} Month{'s' if months > 1 else ''}",
+        "description": f"Unlimited code generation for {months} month{'s' if months > 1 else ''}. 50 Stars/month.",
+        "payload": f"pro_{chat_id}_{months}",
+        "currency": "XTR",
+        "prices": [{"label": f"{months} Month{'s' if months > 1 else ''}", "amount": price}]
+    }, timeout=10)
+
+def answer_pre_checkout(pre_checkout_query_id):
+    requests.post(f"{TELEGRAM_API}/answerPreCheckoutQuery", json={
+        "pre_checkout_query_id": pre_checkout_query_id,
+        "ok": True
+    }, timeout=10)
+
+def send_document(chat_id, filename, content):
+    files = {"document": (filename, content.encode("utf-8"))}
+    requests.post(f"{TELEGRAM_API}/sendDocument",
+                  data={"chat_id": chat_id},
+                  files=files,
+                  timeout=30)
+
+def extract_code_blocks(text):
+    blocks = []
+    parts = text.split("```")
+    for i in range(1, len(parts), 2):
+        lang_line = parts[i].split("\n", 1)
+        lang = lang_line[0].strip() if lang_line else "txt"
+        code = lang_line[1] if len(lang_line) > 1 else parts[i]
+        ext = {"python": "py", "javascript": "js", "solidity": "sol", "bash": "sh"}.get(lang, "txt")
+        filename = f"code_{len(blocks)+1}.{ext}"
+        blocks.append((filename, code.strip()))
+    return blocks
+
+def call_openai(user_message, chat_history=[]):
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(chat_history[-6:])
+    messages.append({"role": "user", "content": user_message})
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 1500
+    }
+
+    r = requests.post(OPENAI_API, headers=headers, json=payload, timeout=25)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+def check_usage_limit(chat_id):
+    str_id = str(chat_id)
+    today = time.strftime("%Y-%m-%d")
+    now = time.time()
+
+    # Check Pro
+    if str_id in usage_store["pro"]:
+        if usage_store["pro"][str_id] > now:
+            return True, 999, usage_store["pro"][str_id]
+        else:
+            del usage_store["pro"][str_id]
+
+    # Free tier
+    if str_id not in usage_store["free"]:
+        usage_store["free"][str_id] = {"count": 0, "date": today}
+
+    user_data = usage_store["free"][str_id]
+    if user_data["date"]!= today:
+        user_data["count"] = 0
+        user_data["date"] = today
+
+    if user_data["count"] >= 3:
+        return False, 0, 0
+
+    user_data["count"] += 1
+    remaining = 3 - user_data["count"]
+    return True, remaining, 0
+
+class handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        chat_id = None
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len)
+            update = json.loads(body)
+
+            # Handle successful payment
+            if "message" in update and "successful_payment" in update["message"]:
+                payment = update["message"]["successful_payment"]
+                payload = payment["invoice_payload"] # format: pro_123456_3
+                parts = payload.split("_")
+                chat_id = int(parts[1])
+                months = int(parts[2])
+
+                str_id = str(chat_id)
+                expiry = time.time() + (months * 30 * 24 * 60 * 60)
+                usage_store["pro"][str_id] = expiry
+
+                expiry_date = time.strftime("%Y-%m-%d", time.localtime(expiry))
+                send_message(chat_id, f"✅ Payment received!\n\nPro active until: {expiry_date}\nUnlimited requests unlocked.")
+                self.send_response(200)
+                self.end_headers()
+                return
+
+            # Handle pre-checkout query
+            if "pre_checkout_query" in update:
+                answer_pre_checkout(update["pre_checkout_query"]["id"])
+                self.send_response(200)
+                self.end_headers()
+                return
+
+            if "message" not in update:
+                self.send_response(200)
+                self.end_headers()
+                return
+
+            msg = update["message"]
+            chat_id = msg["chat"]["id"]
+            text = msg.get("text", "")
+
+            if not text:
+                send_message(chat_id, "Send me a message or code request.")
+                self.send_response(200)
+                self.end_headers()
+                return
+
+            if text.startswith("/start"):
+                send_message(chat_id, "Yo, I’m Pulse Dev.\n\nFree: 3 requests/day\nPro: Unlimited for 30 days\nType /buy to see plans ✨")
+                self.send_response(200)
+                self.end_headers()
+                return
+
+            if text.startswith("/buy"):
+                plans = (
+                    "💎 **Pulse Dev Pro Plans**\n\n"
+                    "**50 Stars = 1 month**\n"
+                    "**150 Stars = 3 months**\n"
+                    "**300 Stars = 6 months**\n"
+                    "**600 Stars = 12 months**\n\n"
+                    "Unlimited requests while active.\n"
+                    "Auto-expires after period.\n\n"
+                    "Use: `/buy 1` for 1 month\n"
+                    "Use: `/buy 12` for 12 months\n"
+                    "50 Stars ≈ $0.75. You can buy Stars cheaper on Telegram desktop."
+                )
+                send_message(chat_id, plans)
+                self.send_response(200)
+                self.end_headers()
+                return
+
+            if text.startswith("/buy "):
+                try:
+                    months = int(text.split()[1])
+                    if months < 1 or months > 12:
+                        send_message(chat_id, "Choose between 1 and 12 months. Example: `/buy 3`")
+                    else:
+                        send_invoice(chat_id, months)
+                except:
+                    send_message(chat_id, "Invalid format. Use: `/buy 3`")
+                self.send_response(200)
+                self.end_headers()
+                return
+
+            # Check usage limit
+            allowed, remaining, expiry = check_usage_limit(chat_id)
+            if not allowed:
+                send_message(chat_id, "🚫 Free limit reached for today. Type /buy for unlimited Pro access.")
+                self.send_response(200)
+                self.end_headers()
+                return
+
+            if remaining == 999:
+                expiry_date = time.strftime("%Y-%m-%d", time.localtime(expiry))
+                send_message(chat_id, f"Working on it... Pro active until {expiry_date}")
+            else:
+                send_message(chat_id, f"Working on it... {remaining} free requests left today.")
+
+            reply = call_openai(text)
+            code_files = extract_code_blocks(reply)
+
+            if code_files:
+                send_message(chat_id, reply.split("```")[0][:800])
+                for filename, code in code_files:
+                    send_document(chat_id, filename, code)
+            else:
+                send_message(chat_id, reply)
+
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            if chat_id:
+                send_message(chat_id, error_msg)
+            if ADMIN_CHAT_ID:
+                send_message(ADMIN_CHAT_ID, f"🚨 Bot Error\n{error_msg}\n\nChat ID: {chat_id}")
+
+        finally:
+            self.send_response(200)
+            self.end_headers()
