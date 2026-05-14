@@ -7,16 +7,15 @@ from datetime import datetime, timezone
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ADMIN_ID = 8429170788 # Your ID - lifetime premium
+ADMIN_ID = 8429170788 # Lifetime premium
 REDIS_URL = os.getenv("REDIS_URL")
 
-# Fail fast if critical env vars are missing
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not set")
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY not set")
 
-# Redis with ping check + fallback
+# Redis setup with fallback
 r = None
 if REDIS_URL:
     try:
@@ -24,7 +23,6 @@ if REDIS_URL:
         r.ping()
     except Exception as e:
         r = None
-        # Alert admin directly, don't call send_message to avoid recursion
         if BOT_TOKEN and ADMIN_ID:
             try:
                 requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -36,10 +34,12 @@ if REDIS_URL:
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 
-STAR_PRICE_30D = 50 # 50 stars for 30 days
-MAX_SUB_DAYS = 365
+# Pricing and limits
+STAR_PRICE_30D = 50
 MIN_SUB_DAYS = 30
+MAX_SUB_DAYS = 365
 FREE_LIMIT = 20
+FREE_COOLDOWN_SEC = 60 # 1 min cooldown between msgs for free users on Vercel free tier
 
 mem_state = {}
 
@@ -62,10 +62,9 @@ def get_user(user_id):
     if r:
         data = r.hgetall(key)
         if not data:
-            data = {"name": "friend", "msgs_today": "0", "last_reset": today, "wallet": "", "exp": "0"}
+            data = {"name": "friend", "msgs_today": "0", "last_reset": today, "wallet": "", "exp": "0", "last_msg": "0"}
             r.hset(key, mapping=data)
 
-        # Reset daily limit
         if data.get("last_reset", "")!= today:
             data["msgs_today"] = "0"
             data["last_reset"] = today
@@ -73,8 +72,7 @@ def get_user(user_id):
         return data
     else:
         if user_id not in mem_state:
-            mem_state[user_id] = {"name": "friend", "msgs_today": "0", "last_reset": today, "wallet": "", "exp": "0"}
-
+            mem_state[user_id] = {"name": "friend", "msgs_today": "0", "last_reset": today, "wallet": "", "exp": "0", "last_msg": "0"}
         if mem_state[user_id]["last_reset"]!= today:
             mem_state[user_id]["msgs_today"] = "0"
             mem_state[user_id]["last_reset"] = today
@@ -98,9 +96,22 @@ def add_premium_days(user_id, days):
     exp = int(get_user(user_id).get("exp", 0))
     if exp < now:
         exp = now
-    new_exp = exp + days * 86400
+    new_exp = min(exp + days * 86400, now + MAX_SUB_DAYS * 86400)
     update_user(user_id, "exp", new_exp)
+
+    # Auto add to premium subscribers list
+    if r:
+        r.sadd("premium_subs", str(user_id))
+    else:
+        if "premium_subs" not in mem_state:
+            mem_state["premium_subs"] = set()
+        mem_state["premium_subs"].add(str(user_id))
     return new_exp
+
+def get_premium_subs():
+    if r:
+        return r.smembers("premium_subs")
+    return mem_state.get("premium_subs", set())
 
 def alert_admin(msg):
     if ADMIN_ID and BOT_TOKEN:
@@ -119,7 +130,6 @@ def call_groq(messages, model, max_tokens):
     return r.json()["choices"][0]["message"]["content"]
 
 def handler(request):
-    # Handle both Vercel request object and local dict for testing
     if hasattr(request, 'get_json'):
         if request.method!= "POST":
             return {"statusCode": 200, "body": "ok"}
@@ -154,9 +164,10 @@ def handle_message(msg):
     user = get_user(user_id)
     if user["name"] == "friend" and name:
         update_user(user_id, "name", name)
-    user["name"] = get_user(user_id)["name"]
+    user["name"] = user["name"] if user["name"]!= "friend" else name
 
     premium = is_premium(user_id)
+    now = int(time.time())
 
     if text.startswith("/start"):
         kb = {
@@ -168,35 +179,39 @@ def handle_message(msg):
             ]
         }
         send_message(chat_id,
-            f"Hey {user['name']}! I'm your AI buddy 🤖\n\n"
-            "**What I do:**\n"
-            "• Chat about anything - casual, helpful\n"
+            f"Yo {user['name']}! I'm NetworkPulse 🤖\n\n"
+            "**I fit help you with:**\n"
+            "• Casual chat, no cap\n"
             "• DePIN farming: Grass, Nodepay, Gradient, VPS\n"
-            "• Dev help: debug code, explain errors, write scripts\n"
-            "• Fix errors, check nodes, optimize earnings\n"
-            f"**Free**: {FREE_LIMIT} msgs/day, fast 8B model\n"
-            "**Premium**: Unlimited, 70B model, priority\n"
-            "Type /help for commands.\n"
-            "Just type what you need."
-      , kb)
+            "• Debug code, explain errors, write scripts\n"
+            "• Optimize your nodes for more earnings\n"
+            f"**Free**: {FREE_LIMIT} msgs/day, 8B model, 1min cooldown\n"
+            "**Premium**: Unlimited, 70B model, fast reply\n"
+            "Type /help for commands.",
+        kb)
 
     elif text.startswith("/help"):
         send_message(chat_id,
             "**Commands:**\n"
             "/start - Main menu\n"
-            "/help - Show this message\n"
+            "/help - Show commands\n"
             "/upgrade - Get premium\n"
-            "/depin - DePIN farming tools\n"
+            "/depin - DePIN tools\n"
             "/setwallet 0x123... - Save wallet\n"
-            "/diagnose - Debug logs [Premium]\n\n"
-            "Or just chat with me normally!"
+            "/diagnose - Debug logs [Premium]\n"
+            "/subs - Check premium count [Admin]\n\n"
+            "Just drop your question and I go answer."
         )
+
+    elif text.startswith("/subs") and user_id == ADMIN_ID:
+        subs = len(get_premium_subs())
+        send_message(chat_id, f"Active premium subs: {subs} 👑")
 
     elif text.startswith("/upgrade"):
         if premium:
             exp_ts = int(get_user(user_id)["exp"])
             exp_date = time.strftime("%Y-%m-%d", time.gmtime(exp_ts))
-            send_message(chat_id, f"You're premium 👑\nExpires: {exp_date}")
+            send_message(chat_id, f"You're premium already 👑\nExpires: {exp_date}")
             return
 
         kb = {
@@ -208,11 +223,11 @@ def handle_message(msg):
         }
         send_message(chat_id,
             "**Upgrade to Premium**\n\n"
-            "• Unlimited messages\n"
+            "• Unlimited messages, no cooldown\n"
             "• Llama 3.3 70B - smarter answers\n"
-            "• Priority replies\n"
+            "• Priority reply, no queue\n"
             "• DePIN node diagnostics\n"
-            "• Dev/code debugging help\n"
+            "• Dev/code debugging\n"
             "Pick a plan:", kb)
 
     elif text.startswith("/setwallet"):
@@ -221,9 +236,8 @@ def handle_message(msg):
             send_message(chat_id, "Usage: `/setwallet 0x123...`")
             return
         wallet = parts[1]
-        # Basic EVM wallet validation
         if not wallet.startswith("0x") or len(wallet)!= 42:
-            send_message(chat_id, "Invalid wallet. Send a valid EVM address like `0x123...abc`")
+            send_message(chat_id, "Invalid wallet. Send valid EVM address like `0x123...abc`")
             return
         update_user(user_id, "wallet", wallet)
         send_message(chat_id, f"Wallet saved ✅\n`{wallet}`")
@@ -231,39 +245,44 @@ def handle_message(msg):
     elif text.startswith("/depin"):
         send_message(chat_id,
             "**DePIN Quick Help**\n\n"
-            "/node - Check node status guides\n"
-            "/earnings - Earnings check tips\n"
-            "/diagnose - Paste error logs here\n"
-            "Or just ask: 'Grass node showing offline, fix?'"
+            "Ask me stuff like:\n"
+            "• 'Grass node offline, fix?'\n"
+            "• 'How to check Nodepay earnings?'\n"
+            "• 'Best VPS for Gradient?'\n"
+            "Use /diagnose if you get error logs."
         )
 
     elif text.startswith("/diagnose"):
         if not premium:
-            send_message(chat_id, "This is premium only 👑\nUse /upgrade to unlock node log debugging.")
+            send_message(chat_id, "This one na premium only 👑\nUse /upgrade to unlock log debugging.")
             return
-        send_message(chat_id, "Paste your error log or node output here and I'll debug it.")
+        send_message(chat_id, "Drop your error log or node output. I go debug am sharp.")
 
     else:
-        # Regular chat / dev chat
+        # Cooldown + rate limit for free users
         msgs = int(user.get("msgs_today", 0))
-
-        if not premium and msgs >= FREE_LIMIT:
-            send_message(chat_id, f"Hit {FREE_LIMIT}/{FREE_LIMIT} free msgs today 🚫\nUse /upgrade for unlimited.")
-            return
+        last_msg = int(user.get("last_msg", 0))
 
         if not premium:
+            if msgs >= FREE_LIMIT:
+                send_message(chat_id, f"You don hit {FREE_LIMIT}/{FREE_LIMIT} free msgs today 🚫\nUse /upgrade for unlimited.")
+                return
+            if now - last_msg < FREE_COOLDOWN_SEC:
+                wait = FREE_COOLDOWN_SEC - (now - last_msg)
+                send_message(chat_id, f"Chill small 😅 Wait {wait}s before next msg. Free tier cooldown.")
+                return
             update_user(user_id, "msgs_today", msgs + 1)
+            update_user(user_id, "last_msg", now)
 
         model = "llama-3.3-70b-versatile" if premium else "llama-3.1-8b-instant"
         max_tokens = 1200 if premium else 600
 
         system = (
-            f"You are NetworkPulse, a friendly AI assistant talking to {user['name']}. "
-            "You're helpful for daily life, DePIN farming, AND software development. "
-            "Be casual, direct, no corporate fluff. "
+            f"You are NetworkPulse, talking to {user['name']}. "
+            "Be casual, direct, Naija-friendly. No corporate talk. "
             "For DePIN: give practical steps. "
-            "For dev: debug code, explain errors, write clean Python/JS, review logic. "
-            "If it's general, be a good chat buddy."
+            "For dev: debug code, explain errors, write clean Python/JS. "
+            "If general, be a good chat buddy."
         )
 
         try:
@@ -282,18 +301,16 @@ def handle_callback(cb):
     data = cb["data"]
 
     if data == "chat":
-        send_message(chat_id, "What's on your mind? Ask me anything.")
+        send_message(chat_id, "Wetin dey sup? Ask me anything.")
     elif data == "depin":
         handle_message({"chat": {"id": chat_id}, "from": {"id": user_id}, "text": "/depin"})
     elif data == "dev":
-        send_message(chat_id, "Drop your code or error here. I'll debug it, explain it, or rewrite it.")
+        send_message(chat_id, "Drop your code or error here. I go debug, explain, or rewrite am.")
     elif data == "upgrade":
         handle_message({"chat": {"id": chat_id}, "from": {"id": user_id}, "text": "/upgrade"})
     elif data.startswith("buy_"):
         days = int(data.split("_")[1])
-        if days < MIN_SUB_DAYS or days > MAX_SUB_DAYS:
-            send_message(chat_id, "Invalid plan.")
-            return
+        days = min(max(days, MIN_SUB_DAYS), MAX_SUB_DAYS)
         stars = int((days / 30) * STAR_PRICE_30D)
         send_invoice(chat_id, days, stars)
 
@@ -316,9 +333,10 @@ def handle_payment(msg):
         days = int(payload.split("_")[1])
         new_exp = add_premium_days(user_id, days)
         exp_date = time.strftime("%Y-%m-%d", time.gmtime(new_exp))
-        send_message(user_id, f"✅ Payment successful!\nPremium active until {exp_date} 👑")
+        send_message(user_id, f"✅ Payment successful!\nPremium active till {exp_date} 👑")
+        alert_admin(f"New sub: {user_id} for {days} days")
 
-# Local testing block
+# Local testing
 if __name__ == "__main__":
     test_update = {
         "message": {
