@@ -1,233 +1,277 @@
 import os
 import json
-import requests
 import time
-from http.server import BaseHTTPRequestHandler
+import requests
+import redis
+from datetime import datetime, timezone
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ADMIN_ID = 8429170788 # Your ID - lifetime premium
+REDIS_URL = os.getenv("REDIS_URL")
+
+r = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-OPENAI_API = "https://api.openai.com/v1/chat/completions"
+GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
 
-# Storage: {"pro": {chat_id: expiry_timestamp}, "free": {chat_id: {count, date}}}
-usage_store = {"pro": {}, "free": {}}
+STAR_PRICE_30D = 50 # 50 stars for 30 days
+MAX_SUB_DAYS = 365
+MIN_SUB_DAYS = 30
+FREE_LIMIT = 20
 
-SYSTEM_PROMPT = """You are Pulse Dev, a senior full-stack developer for DePIN and AI projects.
-Rules:
-1. Write clean, working code. No placeholders, no TODOs unless asked.
-2. Always include setup steps and requirements.txt if needed.
-3. If user asks to generate code, output the code in a ```language``` block and explain it briefly.
-4. Be direct. No fluff, no "As an AI".
-5. If code is over 40 lines, split into multiple files and list them.
-"""
+mem_state = {}
 
-def send_message(chat_id, text):
-    requests.post(f"{TELEGRAM_API}/sendMessage", json={
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }, timeout=10)
+def send_message(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    try:
+        requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=20)
+    except Exception as e:
+        alert_admin(f"send_message failed: {e}")
 
-def send_invoice(chat_id, months):
-    price = months * 50
-    requests.post(f"{TELEGRAM_API}/createInvoiceLink", json={
-        "title": f"Pulse Dev Pro - {months} Month{'s' if months > 1 else ''}",
-        "description": f"Unlimited code generation for {months} month{'s' if months > 1 else ''}. 50 Stars/month.",
-        "payload": f"pro_{chat_id}_{months}",
-        "currency": "XTR",
-        "prices": [{"label": f"{months} Month{'s' if months > 1 else ''}", "amount": price}]
-    }, timeout=10)
+def answer_callback(callback_id):
+    requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": callback_id}, timeout=10)
 
-def answer_pre_checkout(pre_checkout_query_id):
-    requests.post(f"{TELEGRAM_API}/answerPreCheckoutQuery", json={
-        "pre_checkout_query_id": pre_checkout_query_id,
-        "ok": True
-    }, timeout=10)
+def get_user(user_id):
+    key = f"user:{user_id}"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-def send_document(chat_id, filename, content):
-    files = {"document": (filename, content.encode("utf-8"))}
-    requests.post(f"{TELEGRAM_API}/sendDocument",
-                  data={"chat_id": chat_id},
-                  files=files,
-                  timeout=30)
+    if r:
+        data = r.hgetall(key)
+        if not data:
+            data = {"name": "friend", "msgs_today": "0", "last_reset": today, "wallet": "", "exp": "0"}
+            r.hset(key, mapping=data)
 
-def extract_code_blocks(text):
-    blocks = []
-    parts = text.split("```")
-    for i in range(1, len(parts), 2):
-        lang_line = parts[i].split("\n", 1)
-        lang = lang_line[0].strip() if lang_line else "txt"
-        code = lang_line[1] if len(lang_line) > 1 else parts[i]
-        ext = {"python": "py", "javascript": "js", "solidity": "sol", "bash": "sh"}.get(lang, "txt")
-        filename = f"code_{len(blocks)+1}.{ext}"
-        blocks.append((filename, code.strip()))
-    return blocks
+        # Reset daily limit
+        if data.get("last_reset", "")!= today:
+            data["msgs_today"] = "0"
+            data["last_reset"] = today
+            r.hset(key, mapping=data)
+        return data
+    else:
+        if user_id not in mem_state:
+            mem_state[user_id] = {"name": "friend", "msgs_today": "0", "last_reset": today, "wallet": "", "exp": "0"}
 
-def call_openai(user_message, chat_history=[]):
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(chat_history[-6:])
-    messages.append({"role": "user", "content": user_message})
+        if mem_state[user_id]["last_reset"]!= today:
+            mem_state[user_id]["msgs_today"] = "0"
+            mem_state[user_id]["last_reset"] = today
+        return mem_state[user_id]
 
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 1500
-    }
+def update_user(user_id, field, value):
+    key = f"user:{user_id}"
+    if r:
+        r.hset(key, field, str(value))
+    else:
+        mem_state[user_id][field] = str(value)
 
-    r = requests.post(OPENAI_API, headers=headers, json=payload, timeout=25)
+def is_premium(user_id):
+    if user_id == ADMIN_ID:
+        return True
+    exp = int(get_user(user_id).get("exp", 0))
+    return exp > int(time.time())
+
+def add_premium_days(user_id, days):
+    now = int(time.time())
+    exp = int(get_user(user_id).get("exp", 0))
+    if exp < now:
+        exp = now
+    new_exp = exp + days * 86400
+    update_user(user_id, "exp", new_exp)
+    return new_exp
+
+def alert_admin(msg):
+    if ADMIN_ID:
+        try:
+            requests.post(f"{TELEGRAM_API}/sendMessage",
+                          json={"chat_id": ADMIN_ID, "text": f"🚨 Bot Alert:\n`{msg}`", "parse_mode": "Markdown"},
+                          timeout=10)
+        except:
+            pass
+
+def call_groq(messages, model, max_tokens):
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    body = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": max_tokens}
+    r = requests.post(GROQ_API, headers=headers, json=body, timeout=45)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
-def check_usage_limit(chat_id):
-    str_id = str(chat_id)
-    today = time.strftime("%Y-%m-%d")
-    now = time.time()
+def handler(request):
+    if request.method!= "POST":
+        return {"statusCode": 200, "body": "ok"}
 
-    # Check Pro
-    if str_id in usage_store["pro"]:
-        if usage_store["pro"][str_id] > now:
-            return True, 999, usage_store["pro"][str_id]
-        else:
-            del usage_store["pro"][str_id]
+    try:
+        data = request.get_json()
 
-    # Free tier
-    if str_id not in usage_store["free"]:
-        usage_store["free"][str_id] = {"count": 0, "date": today}
+        if "message" in data:
+            handle_message(data["message"])
+        elif "callback_query" in data:
+            cb = data["callback_query"]
+            answer_callback(cb["id"])
+            handle_callback(cb)
+        elif "pre_checkout_query" in data:
+            requests.post(f"{TELEGRAM_API}/answerPreCheckoutQuery",
+                          json={"pre_checkout_query_id": data["pre_checkout_query"]["id"], "ok": True})
+        elif "successful_payment" in data.get("message", {}):
+            handle_payment(data["message"])
 
-    user_data = usage_store["free"][str_id]
-    if user_data["date"]!= today:
-        user_data["count"] = 0
-        user_data["date"] = today
+        return {"statusCode": 200, "body": "ok"}
+    except Exception as e:
+        alert_admin(f"Handler crash: {e}")
+        return {"statusCode": 500, "body": "error"}
 
-    if user_data["count"] >= 3:
-        return False, 0, 0
+def handle_message(msg):
+    chat_id = msg["chat"]["id"]
+    user_id = msg["from"]["id"]
+    text = msg.get("text", "")
+    name = msg["from"].get("first_name", "friend")
 
-    user_data["count"] += 1
-    remaining = 3 - user_data["count"]
-    return True, remaining, 0
+    user = get_user(user_id)
+    if user["name"] == "friend" and name:
+        update_user(user_id, "name", name)
+    user["name"] = get_user(user_id)["name"]
 
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        chat_id = None
+    premium = is_premium(user_id)
+
+    if text.startswith("/start"):
+        kb = {
+            "inline_keyboard": [
+                [{"text": "💬 Chat AI", "callback_data": "chat"}],
+                [{"text": "🌐 DePIN Tools", "callback_data": "depin"}],
+                [{"text": "💻 Dev Help", "callback_data": "dev"}],
+                [{"text": "⭐ Upgrade", "callback_data": "upgrade"}]
+            ]
+        }
+        send_message(chat_id,
+            f"Hey {user['name']}! I'm your AI buddy 🤖\n\n"
+            "**What I do:**\n"
+            "• Chat about anything - casual, helpful\n"
+            "• DePIN farming: Grass, Nodepay, Gradient, VPS\n"
+            "• Dev help: debug code, explain errors, write scripts\n"
+            "• Fix errors, check nodes, optimize earnings\n"
+            f"**Free**: {FREE_LIMIT} msgs/day, fast 8B model\n"
+            "**Premium**: Unlimited, 70B model, priority\n"
+            "Just type what you need."
+      , kb)
+
+    elif text.startswith("/upgrade"):
+        if premium:
+            exp_ts = int(get_user(user_id)["exp"])
+            exp_date = time.strftime("%Y-%m-%d", time.gmtime(exp_ts))
+            send_message(chat_id, f"You're premium 👑\nExpires: {exp_date}")
+            return
+
+        kb = {
+            "inline_keyboard": [
+                [{"text": "30 Days - 50 ⭐", "callback_data": "buy_30"}],
+                [{"text": "90 Days - 140 ⭐", "callback_data": "buy_90"}],
+                [{"text": "365 Days - 500 ⭐", "callback_data": "buy_365"}]
+            ]
+        }
+        send_message(chat_id,
+            "**Upgrade to Premium**\n\n"
+            "• Unlimited messages\n"
+            "• Llama 3.3 70B - smarter answers\n"
+            "• Priority replies\n"
+            "• DePIN node diagnostics\n"
+            "• Dev/code debugging help\n"
+            "Pick a plan:", kb)
+
+    elif text.startswith("/setwallet"):
+        parts = text.split()
+        if len(parts) < 2:
+            send_message(chat_id, "Usage: `/setwallet 0x123...`")
+            return
+        update_user(user_id, "wallet", parts[1])
+        send_message(chat_id, f"Wallet saved ✅\n`{parts[1]}`")
+
+    elif text.startswith("/depin"):
+        send_message(chat_id,
+            "**DePIN Quick Help**\n\n"
+            "/node - Check node status guides\n"
+            "/earnings - Earnings check tips\n"
+            "/diagnose - Paste error logs here\n"
+            "Or just ask: 'Grass node showing offline, fix?'"
+        )
+
+    elif text.startswith("/diagnose"):
+        if not premium:
+            send_message(chat_id, "This is premium only 👑\nUse /upgrade to unlock node log debugging.")
+            return
+        send_message(chat_id, "Paste your error log or node output here and I'll debug it.")
+
+    else:
+        # Regular chat / dev chat
+        msgs = int(user.get("msgs_today", 0))
+
+        if not premium and msgs >= FREE_LIMIT:
+            send_message(chat_id, f"Hit {FREE_LIMIT}/{FREE_LIMIT} free msgs today 🚫\nUse /upgrade for unlimited.")
+            return
+
+        if not premium:
+            update_user(user_id, "msgs_today", msgs + 1)
+
+        model = "llama-3.3-70b-versatile" if premium else "llama-3.1-8b-instant"
+        max_tokens = 1200 if premium else 600
+
+        system = (
+            f"You are NetworkPulse, a friendly AI assistant talking to {user['name']}. "
+            "You're helpful for daily life, DePIN farming, AND software development. "
+            "Be casual, direct, no corporate fluff. "
+            "For DePIN: give practical steps. "
+            "For dev: debug code, explain errors, write clean Python/JS, review logic. "
+            "If it's general, be a good chat buddy."
+        )
+
         try:
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_len)
-            update = json.loads(body)
-
-            # Handle successful payment
-            if "message" in update and "successful_payment" in update["message"]:
-                payment = update["message"]["successful_payment"]
-                payload = payment["invoice_payload"] # format: pro_123456_3
-                parts = payload.split("_")
-                chat_id = int(parts[1])
-                months = int(parts[2])
-
-                str_id = str(chat_id)
-                expiry = time.time() + (months * 30 * 24 * 60 * 60)
-                usage_store["pro"][str_id] = expiry
-
-                expiry_date = time.strftime("%Y-%m-%d", time.localtime(expiry))
-                send_message(chat_id, f"✅ Payment received!\n\nPro active until: {expiry_date}\nUnlimited requests unlocked.")
-                self.send_response(200)
-                self.end_headers()
-                return
-
-            # Handle pre-checkout query
-            if "pre_checkout_query" in update:
-                answer_pre_checkout(update["pre_checkout_query"]["id"])
-                self.send_response(200)
-                self.end_headers()
-                return
-
-            if "message" not in update:
-                self.send_response(200)
-                self.end_headers()
-                return
-
-            msg = update["message"]
-            chat_id = msg["chat"]["id"]
-            text = msg.get("text", "")
-
-            if not text:
-                send_message(chat_id, "Send me a message or code request.")
-                self.send_response(200)
-                self.end_headers()
-                return
-
-            if text.startswith("/start"):
-                send_message(chat_id, "Yo, I’m Pulse Dev.\n\nFree: 3 requests/day\nPro: Unlimited for 30 days\nType /buy to see plans ✨")
-                self.send_response(200)
-                self.end_headers()
-                return
-
-            if text.startswith("/buy"):
-                plans = (
-                    "💎 **Pulse Dev Pro Plans**\n\n"
-                    "**50 Stars = 1 month**\n"
-                    "**150 Stars = 3 months**\n"
-                    "**300 Stars = 6 months**\n"
-                    "**600 Stars = 12 months**\n\n"
-                    "Unlimited requests while active.\n"
-                    "Auto-expires after period.\n\n"
-                    "Use: `/buy 1` for 1 month\n"
-                    "Use: `/buy 12` for 12 months\n"
-                    "50 Stars ≈ $0.75. You can buy Stars cheaper on Telegram desktop."
-                )
-                send_message(chat_id, plans)
-                self.send_response(200)
-                self.end_headers()
-                return
-
-            if text.startswith("/buy "):
-                try:
-                    months = int(text.split()[1])
-                    if months < 1 or months > 12:
-                        send_message(chat_id, "Choose between 1 and 12 months. Example: `/buy 3`")
-                    else:
-                        send_invoice(chat_id, months)
-                except:
-                    send_message(chat_id, "Invalid format. Use: `/buy 3`")
-                self.send_response(200)
-                self.end_headers()
-                return
-
-            # Check usage limit
-            allowed, remaining, expiry = check_usage_limit(chat_id)
-            if not allowed:
-                send_message(chat_id, "🚫 Free limit reached for today. Type /buy for unlimited Pro access.")
-                self.send_response(200)
-                self.end_headers()
-                return
-
-            if remaining == 999:
-                expiry_date = time.strftime("%Y-%m-%d", time.localtime(expiry))
-                send_message(chat_id, f"Working on it... Pro active until {expiry_date}")
-            else:
-                send_message(chat_id, f"Working on it... {remaining} free requests left today.")
-
-            reply = call_openai(text)
-            code_files = extract_code_blocks(reply)
-
-            if code_files:
-                send_message(chat_id, reply.split("```")[0][:800])
-                for filename, code in code_files:
-                    send_document(chat_id, filename, code)
-            else:
-                send_message(chat_id, reply)
-
+            reply = call_groq([
+                {"role": "system", "content": system},
+                {"role": "user", "content": text}
+            ], model, max_tokens)
+            send_message(chat_id, reply)
         except Exception as e:
-            error_msg = f"Error: {str(e)}"
-            if chat_id:
-                send_message(chat_id, error_msg)
-            if ADMIN_CHAT_ID:
-                send_message(ADMIN_CHAT_ID, f"🚨 Bot Error\n{error_msg}\n\nChat ID: {chat_id}")
+            send_message(chat_id, "My brain lagged. Try again in 10s.")
+            alert_admin(f"Groq error for {user_id}: {e}")
 
-        finally:
-            self.send_response(200)
-            self.end_headers()
+def handle_callback(cb):
+    chat_id = cb["message"]["chat"]["id"]
+    user_id = cb["from"]["id"]
+    data = cb["data"]
+
+    if data == "chat":
+        send_message(chat_id, "What's on your mind? Ask me anything.")
+    elif data == "depin":
+        handle_message({"chat": {"id": chat_id}, "from": {"id": user_id}, "text": "/depin"})
+    elif data == "dev":
+        send_message(chat_id, "Drop your code or error here. I'll debug it, explain it, or rewrite it.")
+    elif data == "upgrade":
+        handle_message({"chat": {"id": chat_id}, "from": {"id": user_id}, "text": "/upgrade"})
+    elif data.startswith("buy_"):
+        days = int(data.split("_")[1])
+        if days < MIN_SUB_DAYS or days > MAX_SUB_DAYS:
+            send_message(chat_id, "Invalid plan.")
+            return
+        stars = int((days / 30) * STAR_PRICE_30D)
+        send_invoice(chat_id, days, stars)
+
+def send_invoice(chat_id, days, stars):
+    requests.post(f"{TELEGRAM_API}/sendInvoice", json={
+        "chat_id": chat_id,
+        "title": f"Premium {days} Days",
+        "description": f"Unlimited AI + 70B model for {days} days",
+        "payload": f"premium_{days}",
+        "currency": "XTR",
+        "prices": [{"label": f"{days} Days Premium", "amount": stars}],
+        "provider_token": ""
+    })
+
+def handle_payment(msg):
+    user_id = msg["from"]["id"]
+    payload = msg["successful_payment"]["invoice_payload"]
+
+    if payload.startswith("premium_"):
+        days = int(payload.split("_")[1])
+        new_exp = add_premium_days(user_id, days)
+        exp_date = time.strftime("%Y-%m-%d", time.gmtime(new_exp))
+        send_message(user_id, f"✅ Payment successful!\nPremium active until {exp_date} 👑")
