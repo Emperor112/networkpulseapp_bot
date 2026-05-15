@@ -1,0 +1,3 @@
+[tool.vercel]
+entrypoint = "api/webhook.py"
+runtime = "python3.11"
