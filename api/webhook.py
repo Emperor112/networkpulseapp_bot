@@ -1,451 +1,366 @@
-import os
-import json
-import time
-from datetime import datetime, timezone
+const { Telegraf } = require('telegraf');
+const Redis = require('ioredis');
+const Groq = require('groq-sdk');
 
-try:
-    import requests
-except ImportError:
-    requests = None
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const ADMIN_ID = parseInt(process.env.ADMIN_ID || "8429170788");
+const REDIS_URL = process.env.REDIS_URL;
 
-try:
-    import redis
-except ImportError:
-    redis = None
+if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN not set");
 
-try:
-    from groq import Groq
-except ImportError:
-    Groq = None
-    GroqError = Exception
-else:
-    GroqError = Exception
+const PREMIUM_PRICES = {
+  '7d': { days: 7, stars: 15, label: '7 Days' },
+  '30d': { days: 30, stars: 50, label: '30 Days' },
+  '90d': { days: 90, stars: 120, label: '90 Days' }
+};
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8429170788"))
-REDIS_URL = os.getenv("REDIS_URL")
+const FREE_LIMIT = 15;
+const FREE_COOLDOWN_SEC = 60;
+const PREMIUM_COOLDOWN_SEC = 15;
+const PREMIUM_MAX_TOKENS = 350;
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
+const bot = new Telegraf(BOT_TOKEN);
+const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY, timeout: 5000 }) : null;
+const redis = REDIS_URL ? new Redis(REDIS_URL, { lazyConnect: true, connectTimeout: 3000 }) : null;
 
-STAR_PRICE_30D = 50
-MIN_SUB_DAYS = 30
-MAX_SUB_DAYS = 365
-FREE_LIMIT = 20
-FREE_COOLDOWN_SEC = 90
-DAILY_CHECKIN_COOLDOWN = 86400
-PREMIUM_MAX_TOKENS = 600
-PREMIUM_COOLDOWN_SEC = 30
-GROQ_TIMEOUT = 7
+async function alertAdmin(error, context = "") {
+  const msg = `⚠️ *Bot Error Alert*\n\n*Where:* ${context}\n*Error:* \`${escapeMd(String(error))}\``;
+  try {
+    await bot.telegram.sendMessage(ADMIN_ID, msg, { parse_mode: "MarkdownV2" });
+  } catch (e) {
+    console.log("Failed to send admin alert:", e);
+  }
+}
 
-groq_client = None
-r = None
-mem_state = {}
+function escapeMd(text) {
+  if (!text) return "";
+  return String(text).replace(/[_*\[\]()~`>#+-=|{}.!]/g, '\\$&');
+}
 
-def escape_md(text):
-    if not text:
-        return ""
-    chars = r'_*[]()~`>#+-=|{}.!'
-    return ''.join('\\' + c if c in chars else c for c in str(text))
+async function getUser(userId, name = "") {
+  const key = `u:${userId}`;
+  const today = new Date().toISOString().split('T')[0];
+  
+  if (!redis) return { msgs: 0, last: 0, exp: 0, reset: today, name };
 
-def safe_request(url, **kwargs):
-    if not requests:
-        print("requests not installed")
-        return None
-    try:
-        resp = requests.post(url, timeout=8, **kwargs)
-        if resp.status_code >= 400:
-            print(f"Telegram API error: {resp.status_code} {resp.text}")
-        return resp
-    except Exception as e:
-        print(f"Request failed: {e}")
-        return None
+  try {
+    let data = await redis.hgetall(key);
+    if (!Object.keys(data).length) {
+      data = { msgs: 0, reset: today, last: 0, exp: 0, name };
+      await redis.hset(key, data);
+    }
+    if (data.reset !== today) {
+      await redis.hset(key, { msgs: 0, reset: today, name });
+      data.msgs = 0;
+      data.reset = today;
+    }
+    if (name && data.name !== name) {
+      await redis.hset(key, 'name', name);
+      data.name = name;
+    }
+    return {
+      msgs: parseInt(data.msgs || 0),
+      last: parseInt(data.last || 0),
+      exp: parseInt(data.exp || 0),
+      reset: data.reset,
+      name: data.name || ""
+    };
+  } catch (e) {
+    await alertAdmin(e, "getUser");
+    return { msgs: 0, last: 0, exp: 0, reset: today, name };
+  }
+}
 
-def get_groq_client():
-    global groq_client
-    if groq_client is None and GROQ_API_KEY and Groq:
-        groq_client = Groq(api_key=GROQ_API_KEY, timeout=GROQ_TIMEOUT)
-    return groq_client
+async function updateUser(userId, field, val) {
+  if (!redis) return;
+  try {
+    await redis.hset(`u:${userId}`, field, String(val));
+  } catch (e) {
+    await alertAdmin(e, "updateUser");
+  }
+}
 
-def alert_admin(msg):
-    if not ADMIN_ID or not BOT_TOKEN or not requests:
-        print(f"ADMIN ALERT: {msg}")
-        return
-    safe_request(f"{TELEGRAM_API}/sendMessage",
-                 json={"chat_id": ADMIN_ID, "text": escape_md(str(msg))})
+async function isPremium(userId) {
+  if (userId === ADMIN_ID) return true;
+  const user = await getUser(userId);
+  return user.exp > Math.floor(Date.now() / 1000);
+}
 
-def init_redis():
-    global r
-    if r is None and REDIS_URL and redis:
-        try:
-            r = redis.from_url(
-                REDIS_URL,
-                decode_responses=True,
-                socket_timeout=3,
-                socket_connect_timeout=3
-            )
-            r.ping()
-        except Exception as e:
-            r = None
-            print(f"Redis down: {e}")
-    return r
+async function askGroq(prompt, maxTokens = 200) {
+  if (!groq) return "GROQ_API_KEY not set";
+  try {
+    const resp = await groq.chat.completions.create({
+      model: "llama3-8b-8192",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: maxTokens,
+      temperature: 0.7
+    });
+    return resp.choices[0].message.content;
+  } catch (e) {
+    await alertAdmin(e, "askGroq");
+    return "AI is slow rn. Try again.";
+  }
+}
 
-def send_message(chat_id, text, reply_markup=None, parse_mode="MarkdownV2"):
-    if not BOT_TOKEN or not requests:
-        print("Cannot send message: missing token or requests")
-        return
-    if len(text) > 4000:
-        text = text[:3900] + "\n\n...truncated"
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
-    safe_request(f"{TELEGRAM_API}/sendMessage", json=payload)
+// ===== COMMANDS =====
 
-def answer_callback(callback_id):
-    if not BOT_TOKEN or not requests:
-        return
-    safe_request(f"{TELEGRAM_API}/answerCallbackQuery",
-                 json={"callback_query_id": callback_id})
+bot.start(async (ctx) => {
+  try {
+    const user = await getUser(ctx.from.id, ctx.from.first_name);
+    await ctx.replyWithMarkdownV2(
+`*Bot is live ⚡*
+Welcome ${escapeMd(user.name || ctx.from.first_name)}
 
-def get_user(user_id, telegram_name="friend"):
-    key = f"user:{user_id}"
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    redis_client = init_redis()
+Use /help to see commands`
+    );
+  } catch (e) {
+    await alertAdmin(e, "start command");
+    ctx.reply("Something broke. Try again.");
+  }
+});
 
-    if redis_client:
-        try:
-            data = redis_client.hgetall(key)
-            if not data:
-                data = {"name": telegram_name, "msgs_today": "0", "last_reset": today,
-                        "wallet": "", "exp": "0", "last_msg": "0", "last_checkin": "0",
-                        "last_depin_checkin": "0", "streak": "0"}
-                redis_client.hset(key, mapping=data)
-            else:
-                if data.get("name")!= telegram_name:
-                    redis_client.hset(key, "name", telegram_name)
-                    data["name"] = telegram_name
-            if data.get("last_reset")!= today:
-                redis_client.hset(key, mapping={"msgs_today": "0", "last_reset": today})
-                data["msgs_today"] = "0"
-                data["last_reset"] = today
-            return data
-        except Exception as e:
-            print(f"Redis hgetall failed: {e}")
+bot.help((ctx) => {
+  ctx.replyWithMarkdownV2(
+`*Commands*
+/ask <q> \\- Ask AI
+/upgrade \\- Get premium
+/stats \\- Your usage
+/status \\- Check premium
 
-    if user_id not in mem_state:
-        mem_state[user_id] = {"name": telegram_name, "msgs_today": "0", "last_reset": today,
-                              "wallet": "", "exp": "0", "last_msg": "0", "last_checkin": "0",
-                              "last_depin_checkin": "0", "streak": "0"}
-    if mem_state[user_id]["last_reset"]!= today:
-        mem_state[user_id]["msgs_today"] = "0"
-        mem_state[user_id]["last_reset"] = today
-    return mem_state[user_id]
+Free: ${FREE_LIMIT} msgs/day, 60s cooldown
+Premium: Unlimited, 15s cooldown, 350 tokens`
+  ).catch(e => alertAdmin(e, "help command"));
+});
 
-def update_user(user_id, field, value):
-    redis_client = init_redis()
-    if redis_client:
-        try:
-            redis_client.hset(f"user:{user_id}", field, str(value))
-            return
-        except Exception as e:
-            print(f"Redis hset failed: {e}")
-    if user_id not in mem_state:
-        mem_state[user_id] = {}
-    mem_state[user_id][field] = str(value)
+bot.command('ask', async (ctx) => {
+  try {
+    const prompt = ctx.message.text.replace('/ask', '').trim();
+    if (!prompt) return ctx.reply("Use: `/ask explain quantum`");
 
-def is_premium(user_id):
-    if user_id == ADMIN_ID:
-        return True
-    exp = int(get_user(user_id).get("exp", 0))
-    return exp > int(time.time())
+    const user = await getUser(ctx.from.id, ctx.from.first_name);
+    const premium = await isPremium(ctx.from.id);
+    const cooldown = premium ? PREMIUM_COOLDOWN_SEC : FREE_COOLDOWN_SEC;
+    const now = Math.floor(Date.now() / 1000);
 
-def add_premium_days(user_id, days):
-    now = int(time.time())
-    exp = int(get_user(user_id).get("exp", 0))
-    if exp < now:
-        exp = now
-    new_exp = min(exp + days * 86400, now + MAX_SUB_DAYS * 86400)
+    if (now - user.last < cooldown) {
+      return ctx.reply(`Wait ${cooldown - (now - user.last)}s`);
+    }
+    
+    if (!premium && user.msgs >= FREE_LIMIT) {
+      return ctx.reply("Free limit reached. Use /upgrade to get premium");
+    }
 
-    redis_client = init_redis()
-    if redis_client:
-        try:
-            pipe = redis_client.pipeline()
-            pipe.hset(f"user:{user_id}", "exp", new_exp)
-            pipe.sadd("premium_subs", str(user_id))
-            pipe.execute()
-            return new_exp
-        except Exception as e:
-            print(f"Redis pipeline failed: {e}")
+    await updateUser(ctx.from.id, 'last', now);
+    if (!premium) await updateUser(ctx.from.id, 'msgs', user.msgs + 1);
+    
+    await ctx.reply("Thinking...");
+    const answer = await askGroq(prompt, premium ? PREMIUM_MAX_TOKENS : 200);
+    await ctx.reply(escapeMd(answer));
+  } catch (e) {
+    await alertAdmin(e, "ask command");
+    ctx.reply("Error processing your request.");
+  }
+});
 
-    update_user(user_id, "exp", new_exp)
-    if "premium_subs" not in mem_state:
-        mem_state["premium_subs"] = set()
-    mem_state["premium_subs"].add(str(user_id))
-    return new_exp
+bot.command('upgrade', async (ctx) => {
+  try {
+    if (await isPremium(ctx.from.id)) {
+      return ctx.reply("✅ You already have premium");
+    }
 
-def ask_groq(prompt, max_tokens=400, retries=0):
-    client = get_groq_client()
-    if not client:
-        return "GROQ_API_KEY not set or groq package missing"
-    for attempt in range(retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model="llama3-8b-8192",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=0.7
-            )
-            return resp.choices[0].message.content
-        except Exception as e:
-            if attempt < retries:
-                time.sleep(1)
-                continue
-            print(f"Groq error: {e}")
-            alert_admin(f"Groq error: {e}")
-            return "AI dey sleep small. Try again."
-    return "AI failed."
+    ctx.replyWithMarkdownV2(
+`*Premium*
+✅ Unlimited messages
+✅ 15s cooldown vs 60s
+✅ 350 tokens vs 200
 
-def check_network_health():
-    status = {}
-    if requests:
-        try:
-            r = requests.get("https://api.telegram.org", timeout=5)
-            status["Telegram"] = "✅ OK" if r.status_code == 200 else f"⚠️ {r.status_code}"
-        except:
-            status["Telegram"] = "❌ Down"
-    else:
-        status["Telegram"] = "❌ requests missing"
+Choose a plan:`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: `7 Days - 15 Stars`, callback_data: "buy_7d" }],
+            [{ text: `30 Days - 50 Stars`, callback_data: "buy_30d" }],
+            [{ text: `90 Days - 120 Stars`, callback_data: "buy_90d" }]
+          ]
+        }
+      }
+    );
+  } catch (e) {
+    await alertAdmin(e, "upgrade command");
+    ctx.reply("Error loading upgrade info.");
+  }
+});
 
-    client = get_groq_client()
-    if client:
-        try:
-            client.models.list()
-            status["Groq"] = "✅ OK"
-        except:
-            status["Groq"] = "❌ Down"
-    else:
-        status["Groq"] = "❌ No key"
+bot.on('callback_query', async (ctx) => {
+  try {
+    const data = ctx.callbackQuery.data;
+    if (!data.startsWith('buy_')) return;
 
-    redis_client = init_redis()
-    status["Redis"] = "✅ OK" if redis_client else "❌ Down"
+    const planKey = data.replace('buy_', '');
+    const plan = PREMIUM_PRICES[planKey];
+    if (!plan) return ctx.answerCbQuery("Invalid plan");
 
-    msg = "*Network Health Check*\n\n"
-    for service, state in status.items():
-        msg += f"{escape_md(service)}: {state}\n"
-    msg += "\n✅ Safe to run projects." if all("✅" in v for v in status.values()) else "\n⚠️ Hold off on heavy tasks."
-    return msg
+    await ctx.answerCbQuery();
+    await ctx.replyWithInvoice({
+      chat_id: ctx.from.id,
+      title: `Premium ${plan.label}`,
+      description: `Unlimited messages, 15s cooldown, 350 tokens for ${plan.days} days`,
+      payload: `premium_${planKey}`,
+      provider_token: "",
+      currency: "XTR",
+      prices: [{ label: plan.label, amount: plan.stars }],
+      start_parameter: `premium_${planKey}`
+    });
+  } catch (e) {
+    await alertAdmin(e, "callback_query");
+    ctx.answerCbQuery("Payment error");
+  }
+});
 
-def handle_message(msg):
-    chat_id = msg["chat"]["id"]
-    user_id = msg["from"]["id"]
-    text = msg.get("text", "").strip()
-    telegram_name = msg["from"].get("first_name", "friend")
-    user = get_user(user_id, telegram_name)
-    now = int(time.time())
-    premium = is_premium(user_id)
+bot.command('stats', async (ctx) => {
+  try {
+    const user = await getUser(ctx.from.id);
+    const premium = await isPremium(ctx.from.id);
+    ctx.replyWithMarkdownV2(
+`*Stats*
+Messages today: ${user.msgs}/${FREE_LIMIT}
+Status: ${premium ? 'Premium' : 'Free'}`
+    );
+  } catch (e) {
+    await alertAdmin(e, "stats command");
+    ctx.reply("Error loading stats.");
+  }
+});
 
-    if text == "/start":
-        send_message(chat_id, f"Yo {escape_md(user['name'])}! Bot dey alive ✅\nUse /help to see commands")
-        return
+bot.command('status', async (ctx) => {
+  try {
+    const premium = await isPremium(ctx.from.id);
+    const user = await getUser(ctx.from.id);
+    const expDate = user.exp > 0 ? new Date(user.exp * 1000).toISOString().split('T')[0] : "None";
+    ctx.reply(premium ? `✅ Premium active till ${expDate}` : "❌ No active premium. Use /upgrade");
+  } catch (e) {
+    await alertAdmin(e, "status command");
+    ctx.reply("Error checking status.");
+  }
+});
 
-    if text == "/premium":
-        if premium:
-            exp = int(user.get("exp", 0))
-            if user_id == ADMIN_ID:
-                send_message(chat_id, "✅ You have Lifetime Premium\nNo expiry")
-            else:
-                remaining = max(0, exp - now)
-                days = remaining // 86400
-                hours = (remaining % 86400) // 3600
-                mins = (remaining % 3600) // 60
-                send_message(chat_id,
-                    f"✅ You have Premium\n"
-                    f"Expires in: {days}d {hours}h {mins}m\n"
-                    f"Enjoy unlimited AI!"
-                )
-        else:
-            markup = {"inline_keyboard": [[{"text": f"Buy 30 days - {STAR_PRICE_30D} Stars", "pay": True}]]}
-            send_message(chat_id,
-                "*Premium Benefits*\n"
-                "✅ Unlimited /ask\n"
-                "✅ 30s cooldown instead of 90s\n"
-                "✅ /deep for long answers\n"
-                "✅ /summarize text\n"
-                f"\nPrice: {STAR_PRICE_30D} Stars for 30 days\n"
-                "Pay with Telegram Stars",
-                markup
-            )
-        return
+bot.command('giveprem', async (ctx) => {
+  try {
+    if (ctx.from.id !== ADMIN_ID) return ctx.reply("Not allowed");
+    const parts = ctx.message.text.split(' ');
+    const targetId = parseInt(parts[1]);
+    const days = Math.max(1, parseInt(parts[2]) || 30);
+    if (!targetId) return ctx.reply("Use: /giveprem USERID DAYS");
 
-    if text == "/help":
-        help_text = (
-            "*Commands*\n"
-            "/ask <question> \\- Chat with AI\n"
-            "/premium \\- View benefits & buy premium\n"
-            "/stats \\- Your usage stats\n"
-            "/checkin \\- Daily check\\-in\n"
-            "/depin \\- Daily DePIN check\\-in\n"
-            "/status \\- Check premium\n"
-            "/network \\- Check network health\n"
-        )
-        if premium:
-            help_text += "\n*Premium Commands*\n"
-            help_text += "/deep <question> \\- Short AI answer\n"
-            help_text += "/summarize <text> \\- Summarize text\n"
-        help_text += f"\nFree tier: {FREE_LIMIT} msgs/day, {FREE_COOLDOWN_SEC}s cooldown"
-        send_message(chat_id, help_text)
-        return
+    const newExp = Math.floor(Date.now() / 1000) + days * 86400;
+    await updateUser(targetId, 'exp', newExp);
+    ctx.reply(`✅ Gave ${days}d premium to ${targetId}`);
+  } catch (e) {
+    await alertAdmin(e, "giveprem command");
+    ctx.reply("Error giving premium.");
+  }
+});
 
-    if text == "/stats":
-        msgs = int(user.get("msgs_today", 0))
-        streak = int(user.get("streak", 0))
-        exp = int(user.get("exp", 0))
-        exp_str = "Lifetime" if user_id == ADMIN_ID else (
-            datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%d") if exp > now else "None"
-        )
-        send_message(chat_id,
-            f"*Your Stats*\n"
-            f"Messages today: {msgs}/{FREE_LIMIT}\n"
-            f"Streak: {streak} days 🔥\n"
-            f"Premium: {escape_md(exp_str)}\n"
-            f"Status: {'Premium' if premium else 'Free'}"
-        )
-        return
+bot.command('network', async (ctx) => {
+  try {
+    if (ctx.from.id !== ADMIN_ID) return;
 
-    if text == "/status":
-        if premium:
-            exp = int(user.get("exp", 0))
-            exp_date = "Lifetime" if user_id == ADMIN_ID else datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%d")
-            send_message(chat_id, f"✅ Premium active till {escape_md(exp_date)}")
-        else:
-            send_message(chat_id, "❌ No active premium. Use /premium to upgrade")
-        return
+    const status = {};
+    try {
+      await bot.telegram.getMe();
+      status.Telegram = "✅ OK";
+    } catch (e) {
+      status.Telegram = "❌ Down";
+    }
 
-    if text == "/network":
-        send_message(chat_id, check_network_health())
-        return
+    if (groq) {
+      try {
+        await groq.models.list();
+        status.Groq = "✅ OK";
+      } catch (e) {
+        status.Groq = "❌ Bad key";
+      }
+    } else {
+      status.Groq = "❌ No key";
+    }
 
-    if text == "/checkin":
-        last = int(user.get("last_checkin", 0))
-        if now - last < DAILY_CHECKIN_COOLDOWN:
-            wait = DAILY_CHECKIN_COOLDOWN - (now - last)
-            send_message(chat_id, f"Already checked in. Come back in {wait//3600}h {wait%3600//60}m")
-            return
-        streak = int(user.get("streak", 0)) + 1
-        update_user(user_id, "last_checkin", now)
-        update_user(user_id, "streak", streak)
-        send_message(chat_id, f"✅ Daily check\\-in done! Streak: {streak} days 🔥")
-        return
+    status.Redis = redis ? "✅ OK" : "❌ Down";
 
-    if text == "/depin":
-        last = int(user.get("last_depin_checkin", 0))
-        if now - last < DAILY_CHECKIN_COOLDOWN:
-            wait = DAILY_CHECKIN_COOLDOWN - (now - last)
-            send_message(chat_id, f"DePIN check\\-in done already. Wait {wait//3600}h {wait%3600//60}m")
-            return
-        update_user(user_id, "last_depin_checkin", now)
-        tips = ask_groq("Give 1 short tip for DePIN farmers today. 1 sentence.", max_tokens=80)
-        send_message(chat_id, f"✅ DePIN check\\-in recorded!\n\n*Daily Tip*: {escape_md(tips)}")
-        return
+    let msg = "*Network Health*\n\n";
+    for (const [s, v] of Object.entries(status)) {
+      msg += `${escapeMd(s)}: ${v}\n`;
+    }
+    ctx.replyWithMarkdownV2(msg);
+  } catch (e) {
+    await alertAdmin(e, "network command");
+  }
+});
 
-    if text.startswith("/deep"):
-        if not premium:
-            send_message(chat_id, "🔒 Premium only. Use /premium to unlock AI answers.")
-            return
-        prompt = text[5:].strip()
-        if not prompt:
-            send_message(chat_id, "Send like this: `/deep explain quantum physics`")
-            return
-        send_message(chat_id, "Thinking...")
-        answer = ask_groq(prompt, max_tokens=PREMIUM_MAX_TOKENS, retries=0)
-        send_message(chat_id, answer, parse_mode=None) # Fixed: no Markdown escaping
-        return
+// ===== PAYMENTS =====
+bot.on('pre_checkout_query', async (ctx) => {
+  try {
+    const payload = ctx.update.pre_checkout_query.invoice_payload;
+    const planKey = payload.replace('premium_', '');
+    if (payload.startsWith('premium_') && PREMIUM_PRICES[planKey]) {
+      await ctx.answerPreCheckoutQuery(true);
+    } else {
+      await ctx.answerPreCheckoutQuery(false, "Invalid payment");
+    }
+  } catch (e) {
+    await alertAdmin(e, "pre_checkout_query");
+    await ctx.answerPreCheckoutQuery(false, "Error processing payment");
+  }
+});
 
-    if text.startswith("/summarize"):
-        if not premium:
-            send_message(chat_id, "🔒 Premium only. Use /premium to unlock text summarization.")
-            return
-        content = text[11:].strip()
-        if not content:
-            send_message(chat_id, "Send like this: `/summarize [text]`")
-            return
-        if len(content) > 2000:
-            send_message(chat_id, "Text too long. Max 2000 chars on free tier.")
-            return
-        send_message(chat_id, "Summarizing...")
-        answer = ask_groq(f"Summarize in 3 bullets:\n{content}", max_tokens=200, retries=0)
-        send_message(chat_id, answer, parse_mode=None) # Fixed: no Markdown escaping
-        return
+bot.on('successful_payment', async (ctx) => {
+  try {
+    const payment = ctx.update.message.successful_payment;
+    const chargeId = payment.telegram_payment_charge_id;
+    
+    if (redis) {
+      const exists = await redis.get(`payment:${chargeId}`);
+      if (exists) return ctx.reply("Payment already processed");
+      await redis.setex(`payment:${chargeId}`, 86400, '1');
+    }
 
-    if text.startswith("/ask"):
-        prompt = text[4:].strip()
-        if not prompt:
-            send_message(chat_id, "Send like this: `/ask explain quantum`")
-            return
-        cooldown = PREMIUM_COOLDOWN_SEC if premium else FREE_COOLDOWN_SEC
-        last_msg = int(user.get("last_msg", 0))
-        if now - last_msg < cooldown:
-            send_message(chat_id, f"Wait {cooldown - (now - last_msg)}s before next message.")
-            return
-        if not premium:
-            msgs = int(user.get("msgs_today", 0))
-            if msgs >= FREE_LIMIT:
-                send_message(chat_id, "Free limit reach for today. Use /premium to upgrade.")
-                return
-            update_user(user_id, "msgs_today", msgs + 1)
-        update_user(user_id, "last_msg", now)
-        send_message(chat_id, "Thinking...")
-        answer = ask_groq(prompt, max_tokens=300 if not premium else PREMIUM_MAX_TOKENS, retries=0)
-        send_message(chat_id, escape_md(answer))
-        return
+    const planKey = payment.invoice_payload.replace('premium_', '');
+    const plan = PREMIUM_PRICES[planKey];
 
-    send_message(chat_id, "Send `/ask your question` or use /help")
+    if (!plan || payment.total_amount !== plan.stars || payment.currency !== "XTR") {
+      return ctx.reply("Payment mismatch");
+    }
 
-def handle_precheckout(precheckout):
-    if not BOT_TOKEN or not requests:
-        return
-    safe_request(f"{TELEGRAM_API}/answerPreCheckoutQuery",
-                 json={"precheckout_query_id": precheckout["id"], "ok": True})
+    const newExp = Math.floor(Date.now() / 1000) + plan.days * 86400;
+    await updateUser(ctx.from.id, 'exp', newExp);
+    await ctx.reply(`✅ Payment successful! Premium activated for ${plan.days} days`);
+    
+    await alertAdmin(`User ${ctx.from.id} bought ${plan.label} premium`, "Payment");
+  } catch (e) {
+    await alertAdmin(e, "successful_payment");
+    ctx.reply("Payment went through but activation failed. Contact admin.");
+  }
+});
 
-def handle_successful_payment(msg):
-    chat_id = msg["chat"]["id"]
-    user_id = msg["from"]["id"]
-    new_exp = add_premium_days(user_id, MIN_SUB_DAYS)
-    exp_date = datetime.fromtimestamp(new_exp, tz=timezone.utc).strftime("%Y-%m-%d")
-    send_message(chat_id, f"✅ Payment successful! Premium active till {escape_md(exp_date)}")
+// ===== MISC =====
+bot.on('text', async (ctx) => {
+  try {
+    if (!ctx.message.text.startsWith('/')) {
+      ctx.reply("Send `/ask your question`");
+    }
+  } catch (e) {
+    await alertAdmin(e, "text handler");
+  }
+});
 
-def handler(request):
-    try:
-        if request.method!= "POST":
-            return {"statusCode": 200, "body": "OK", "headers": {"Content-Type": "text/plain"}}
-        body = request.body
-        if not body:
-            return {"statusCode": 200, "body": "Empty", "headers": {"Content-Type": "text/plain"}}
-        if isinstance(body, bytes):
-            body = body.decode("utf-8")
-        try:
-            update = json.loads(body)
-        except Exception as e:
-            alert_admin(f"Invalid JSON: {e}")
-            return {"statusCode": 400, "body": "Bad Request", "headers": {"Content-Type": "text/plain"}}
-
-        if "message" in update:
-            msg = update["message"]
-            if "successful_payment" in msg:
-                handle_successful_payment(msg)
-            else:
-                handle_message(msg)
-        elif "callback_query" in update:
-            cq = update["callback_query"]
-            answer_callback(cq["id"])
-        elif "pre_checkout_query" in update:
-            handle_precheckout(update["pre_checkout_query"])
-
-        return {"statusCode": 200, "body": "OK", "headers": {"Content-Type": "text/plain"}}
-
-    except Exception as e:
-        print(f"Handler crash: {e}")
-        alert_admin(f"Handler crash: {e}")
-        return {"statusCode": 500, "body": "Error", "headers": {"Content-Type": "text/plain"}}
+// ===== VERCEL HANDLER =====
+module.exports = async (req, res) => {
+  if (req.method !== 'POST') return res.status(200).send('OK');
+  try { 
+    await bot.handleUpdate(req.body); 
+  } catch (e) {
+    console.log("Handler error:", e);
+    await alertAdmin(e, "main handler");
+  }
+  res.status(200).send('OK');
+};
