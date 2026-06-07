@@ -1,303 +1,366 @@
-import os, json, time, asyncio, aiohttp
-from datetime import datetime
-from collections import defaultdict
+import os, time, asyncio, aiohttp
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from groq import Groq
+from telegram.ext import Application, CommandHandler, ContextTypes
 
+# ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROQ_KEY = os.getenv("GROQ_KEY")
 USDT_WALLET = os.getenv("USDT_WALLET")
-TRON_API = os.getenv("TRON_PRO_API_KEY")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x}
+TRON_PRO_API_KEY = os.getenv("TRON_PRO_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-ADS_LINKS = [os.getenv("ADS_LINK"), os.getenv("MONETAG_LINK", "")]
-
-# Pricing - low entry for new bot
-PLANS = {"7d": 7*24*3600, "1m": 30*24*3600, "3m": 90*24*3600, "6m": 180*24*3600}
-PRICES = {"7d": 1, "1m": 3, "3m": 7, "6m": 12}
-
-# Token limits - optimized for 5k users
-MAX_TOKENS = {"free": 120, "pro": 250, "premium": 350}
-SPAM_COOLDOWN = 3
-DAILY_MSG_LIMIT = {"free": 5, "pro": 30, "premium": 100}
-
-groq_client = Groq(api_key=GROQ_KEY)
-USERS_FILE = "users.json"
-user_cache = {}
-cache_lock = asyncio.Lock()
-price_cache = {}
+TRON_USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 CACHE_TTL = 60
-chat_history = defaultdict(list)
 
-def get_today(): return time.strftime("%Y-%m-%d")
-def get_expiry(tier):
-    if tier == "premium": return 9999
-    if tier.startswith("pro_"):
-        try: return int(tier.split("_")[1])
-        except: return 0
-    return 0
-def tier_key(tier): return tier.split("_")[0]
+# Pricing
+PRICES = {
+    "pro": {"7d": 0.99, "1m": 2.99, "3m": 6.99, "6m": 12.99},
+    "premium": {"7d": 1.99, "1m": 4.99, "3m": 11.99, "6m": 21.99}
+}
 
-async def load_user(uid):
-    uid = str(uid)
-    async with cache_lock:
-        if uid in user_cache: return user_cache[uid]
-    try:
-        with open(USERS_FILE) as f: users = json.load(f)
-    except: users = {}
-    if uid not in users:
-        users[uid] = {"tier": "premium" if int(uid) in ADMIN_IDS else "free", "msgs_today": 0, "last_reset": get_today(), "last_msg_time": 0}
-        with open(USERS_FILE, "w") as f: json.dump(users, f)
-    u = users[uid]
-    if u["tier"].startswith("pro_") and time.time() > get_expiry(u["tier"]):
-        u["tier"] = "free"; users[uid] = u
-        with open(USERS_FILE, "w") as f: json.dump(users, f)
-    async with cache_lock: user_cache[uid] = u
-    return u
+DAYS = {"7d": 7, "1m": 30, "3m": 90, "6m": 180}
 
-async def save_user(uid, u):
-    uid = str(uid)
-    async with cache_lock:
-        user_cache[uid] = u
-        with open(USERS_FILE, "w") as f: json.dump(users, f)
+# ===== DATA =====
+paid_users = {}
+blocked_users = set()
+referrals = {}
+ref_cache = {}
+price_cache = {"data": None, "ts": 0}
+depin_cache = {"data": None, "ts": 0}
 
-async def check_limit(uid):
-    if int(uid) in ADMIN_IDS: return True, ""
-    u = await load_user(uid)
+# ===== HELPERS =====
+async def get_tier(uid):
+    if str(uid) == str(ADMIN_ID):
+        return "admin"
+    data = paid_users.get(str(uid))
+    if not data:
+        return "free"
+    if data["exp"] <= time.time():
+        return "free"
+    return data["tier"]
+
+async def is_pro(uid):
+    tier = await get_tier(uid)
+    return tier in ["pro", "premium", "admin"] and str(uid) not in blocked_users
+
+async def is_premium(uid):
+    tier = await get_tier(uid)
+    return tier in ["premium", "admin"] and str(uid) not in blocked_users
+
+async def days_left(uid):
+    if str(uid) == str(ADMIN_ID):
+        return 9999
+    data = paid_users.get(str(uid))
+    if not data:
+        return 0
+    left = data["exp"] - time.time()
+    return max(0, int(left / 86400))
+
+def get_sub_count():
     now = time.time()
-    if u["last_reset"]!= get_today():
-        u["msgs_today"] = 0; u["last_reset"] = get_today()
-    tk = tier_key(u["tier"])
-    if u["msgs_today"] >= DAILY_MSG_LIMIT[tk]:
-        return False, f"Daily limit: {DAILY_MSG_LIMIT[tk]} msgs. /upgrade to remove limits"
-    if now - u["last_msg_time"] < SPAM_COOLDOWN:
-        return False, f"Wait {int(SPAM_COOLDOWN - (now - u['last_msg_time']))}s"
-    u["last_msg_time"] = now; u["msgs_today"] += 1
-    await save_user(uid, u)
-    return True, ""
+    return len([u for u in paid_users.values() if u["exp"] > now])
 
-async def groq_chat(uid, msg):
-    u = await load_user(uid)
-    tk = tier_key(u["tier"])
-    # Truncate long prompts for free users to save tokens
-    if tk == "free" and len(msg) > 200:
-        msg = msg[:200] + "..."
-    system_prompt = "You are NetworkPulse_AI. Be direct. Max 2 sentences." if tk == "free" else "You are NetworkPulse_AI. Be direct, helpful, good at coding and DePIN info."
+async def get_usdt_value(tx):
     try:
-        resp = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "system", "content": system_prompt},
-                      {"role": "user", "content": msg}],
-            max_tokens=MAX_TOKENS[tk], temperature=0.7
-        )
-        reply = resp.choices[0].message.content
-        if tk == "pro":
-            chat_history[uid].append(reply)
-            if len(chat_history[uid]) > 5: chat_history[uid].pop(0)
-        return reply
+        return int(tx["value"]) / 1e6
+    except:
+        return 0
+
+async def get_groq_prices(prompt):
+    if not GROQ_API_KEY:
+        return "Groq API key not set"
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [
+            {"role": "system", "content": "Return only current crypto prices and 24h % change. Format: SYMBOL: $price +x.x%"},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 300
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, headers=headers, json=payload, timeout=10) as r:
+                if r.status!= 200:
+                    return None
+                data = await r.json()
+                return data["choices"][0]["message"]["content"].strip()
+    except:
+        return None
+
+async def check_payments(app):
+    if not TRON_PRO_API_KEY or not USDT_WALLET:
+        return
+    url = f"https://api.trongrid.io/v1/accounts/{USDT_WALLET}/transactions/trc20"
+    params = {"limit": 20, "contract_address": TRON_USDT_CONTRACT}
+    headers = {"TRON-PRO-API-KEY": TRON_PRO_API_KEY}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=headers, params=params) as r:
+                data = await r.json()
+                for tx in data.get("data", []):
+                    value = await get_usdt_value(tx)
+                    from_addr = tx["from"]
+                    for uid, pending in list(app.bot_data.get("pending_payments", {}).items()):
+                        if pending["addr"] == from_addr and value >= pending["price"]:
+                            days = DAYS[pending["dur"]]
+                            paid_users[uid] = {
+                                "tier": pending["tier"],
+                                "exp": time.time() + days * 86400
+                            }
+                            try:
+                                await app.bot.send_message(
+                                    chat_id=int(uid),
+                                    text=f"✅ {pending['tier'].title()} {pending['dur']} activated for {days} days."
+                                )
+                            except:
+                                pass
+                            del app.bot_data["pending_payments"][uid]
     except Exception as e:
-        if "429" in str(e): return "Bot busy. Try again in 10s."
-        return "Error. Try again."
+        print(f"Payment check error: {e}")
 
-async def get_price(coin_id):
-    now = time.time()
-    if coin_id in price_cache and now - price_cache[coin_id][1] < CACHE_TTL:
-        return price_cache[coin_id][0]
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd", timeout=5) as r:
-                data = await r.json()
-                price = data.get(coin_id, {}).get("usd")
-                if price: price_cache[coin_id] = (price, now)
-                return price
-        except: return None
-
-async def get_trending():
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get("https://api.coingecko.com/api/v3/search/trending", timeout=5) as r:
-                data = await r.json()
-                return [c["item"]["id"] for c in data["coins"][:5]]
-        except: return ["bitcoin","ethereum","solana","pi-network","toncoin"]
-
+# ===== USER COMMANDS =====
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if uid in blocked_users:
+        return
+    if ctx.args:
+        ref = ctx.args[0]
+        if ref!= uid and ref not in referrals.get(uid, []):
+            referrals.setdefault(uid, []).append(ref)
+            ref_cache[ref] = ref_cache.get(ref, 0) + 12
+    tier = await get_tier(uid)
     await update.message.reply_text(
-        "👋 NetworkPulse_AI\n"
-        "/price <coin> - Crypto price\n"
-        "/chat <msg> - AI Q&A + coding\n"
-        "/profile - Your stats\n"
-        "/faq - How to use\n"
-        "/upgrade - Paid plans\n"
-        "/depin - DePIN info\n"
-        "Pro unlocks: /wallet, /airdrop, /history, all coins")
+        f"Welcome! Tier: {tier.title()}\n"
+        f"Free: /price\n"
+        f"Pro/Premium: /pay to upgrade\n"
+        f"Check sub: /days\n"
+        f"Refer: share your ID {uid} for +12h per referral"
+    )
 
 async def price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ok, err = await check_limit(uid)
-    if not ok: return await update.message.reply_text(err)
-    u = await load_user(uid)
-    tk = tier_key(u["tier"])
-    coin_input = ctx.args[0].lower() if ctx.args else None
-    if not coin_input or tk == "free":
-        trending = await get_trending()
-        msg = "🔥 Top 5 Trending:\n"
-        for cid in trending:
-            p = await get_price(cid)
-            msg += f"{cid}: ${p:,.4f}\n" if p else f"{cid}: N/A\n"
-        if tk == "free": msg += "\n/upgrade to check any coin"
-        return await update.message.reply_text(msg)
-    coin_map = {"pi": "pi-network", "btc": "bitcoin", "eth": "ethereum", "sol": "solana", "ton": "toncoin"}
-    coin_id = coin_map.get(coin_input, coin_input)
-    price = await get_price(coin_id)
-    if price is None: await update.message.reply_text(f"Coin '{coin_input}' not found.")
-    else: await update.message.reply_text(f"{coin_input.upper()}: ${price:,.6f}".rstrip('0').rstrip('.'))
+    uid = str(update.effective_user.id)
+    if uid in blocked_users:
+        return
 
-async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ok, err = await check_limit(uid)
-    if not ok: return await update.message.reply_text(err)
-    u = await load_user(uid)
-    msg = " ".join(ctx.args) if ctx.args else update.message.text
-    reply = await groq_chat(uid, msg)
-    if u["tier"] == "free" and ADS_LINKS[0]:
-        ad = ADS_LINKS[u["msgs_today"] % 2] if ADS_LINKS[1] else ADS_LINKS[0]
-        if ad: reply += f"\n\n🔗 {ad}\n\n/upgrade to remove ads"
-    await update.message.reply_text(reply)
+    tier = await get_tier(uid)
+    now = time.time()
 
-async def profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    u = await load_user(uid)
-    tk = tier_key(u["tier"])
-    left = max(0, DAILY_MSG_LIMIT[tk] - u["msgs_today"])
-    expiry = get_expiry(u["tier"])
-    expiry_str = "Never" if expiry == 9999 else ("Expired" if expiry == 0 else datetime.fromtimestamp(expiry).strftime("%Y-%m-%d"))
-    ads = "Yes" if u["tier"] == "free" else "No"
-    await update.message.reply_text(f"👤 Profile\nTier: {tk.upper()}\nMessages left: {left}/{DAILY_MSG_LIMIT[tk]}\nPlan expires: {expiry_str}\nAds: {ads}")
+    if tier == "free":
+        data = "BTC: $67,234 +2.1%\nETH: $3,412 +1.8%\nSOL: $152 +3.5%\nBNB: $585 +0.9%\nXRP: $0.52 +1.2%"
+        await update.message.reply_text(f"Free - Top 5:\n{data}\n\n/pay to unlock full data + DePIN")
+        return
 
-async def faq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 FAQ\nQ: How to upgrade?\nA: /upgrade -> pay USDT TRC20 -> /report + send screenshot\n"
-        "Q: Which USDT network?\nA: TRC20 only\nQ: When activated?\nA: Admin checks screenshot, usually <1hr\n"
-        "Q: Why ads?\nA: Free tier shows ads. /upgrade to remove\nQ: What is DePIN?\nA: Earn crypto by sharing resources")
+    if price_cache["data"] and now - price_cache["ts"] < CACHE_TTL:
+        data = price_cache["data"]
+    else:
+        data = await get_groq_prices("BTC ETH SOL BNB XRP ADA DOGE AVAX MATIC LINK DOT")
+        if not data:
+            data = price_cache["data"] or "BTC: $67k\nETH: $3.4k\nSOL: $152\nBNB: $585\nXRP: $0.52"
+        else:
+            price_cache["data"] = data
+            price_cache["ts"] = now
 
-async def upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = "💳 Upgrade Plans - USDT TRC20 ONLY:\n\n"
-    for plan, price in PRICES.items():
-        days = plan.replace("d", " Days").replace("m", " Month").replace("1 Month", "1 Month").replace("3 Month", "3 Months").replace("6 Month", "6 Months")
-        text += f"{plan.upper()}: {price} USDT - {days}\n"
-    text += f"\nSend to:\n`{USDT_WALLET}`\n\nThen /report + send screenshot.\n⚠️ TRC20 only."
-    await update.message.reply_text(text)
-
-async def report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message.photo:
-        return await update.message.reply_text("Send payment screenshot here after paying.")
-    uid = update.effective_user.id
-    for admin in ADMIN_IDS:
-        try:
-            await ctx.bot.forward_message(admin, update.effective_chat.id, update.message_id)
-            await ctx.bot.send_message(admin, f"Payment from {uid}. Use /adduser {uid} <plan>")
-        except: pass
-    await update.message.reply_text("Screenshot sent. You’ll be activated once verified.")
+    await update.message.reply_text(f"{tier.title()} Data:\n{data}")
 
 async def depin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ok, err = await check_limit(uid)
-    if not ok: return await update.message.reply_text(err)
-    await update.message.reply_text("📡 DePIN Projects:\nHelium - Wireless\nRender - GPU\nGrass - Bandwidth\nAkash - Cloud\nAsk me about any DePIN.")
+    uid = str(update.effective_user.id)
+    if uid in blocked_users:
+        return
+    if not await is_premium(uid):
+        await update.message.reply_text("DePIN tracker is Premium only. /pay to upgrade.")
+        return
 
-async def wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    u = await load_user(uid)
-    if tier_key(u["tier"]) == "free":
-        return await update.message.reply_text("Pro only. /upgrade to unlock wallet checker.")
-    if not ctx.args: return await update.message.reply_text("Usage: /wallet <TRX_address>")
-    addr = ctx.args[0]
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(f"https://api.trongrid.io/v1/accounts/{addr}", timeout=5) as r:
-                data = await r.json()
-                trx = int(data["data"][0].get("balance",0))/1e6
-                await update.message.reply_text(f"TRX: {trx}\nUSDT TRC20: Check on Tronscan")
-        except: await update.message.reply_text("Invalid address or API error")
+    now = time.time()
+    if depin_cache["data"] and now - depin_cache["ts"] < CACHE_TTL:
+        data = depin_cache["data"]
+    else:
+        data = await get_groq_prices("RENDER HNT AKT AR FIL THETA IOTX ROSE")
+        if not data:
+            data = depin_cache["data"] or "RENDER: $7.12\nHNT: $4.05\nAKT: $2.88\nAR: $18.45\nFIL: $3.21"
+        else:
+            depin_cache["data"] = data
+            depin_cache["ts"] = now
 
-async def airdrop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    u = await load_user(uid)
-    if tier_key(u["tier"]) == "free":
-        return await update.message.reply_text("Pro only. /upgrade to unlock airdrop list.")
-    await update.message.reply_text("🪂 Active DePIN Airdrops:\n1. Grass - Run node\n2. Gradient - Share bandwidth\n3. Dawn - WiFi sharing\nAsk for setup guide.")
+    await update.message.reply_text(f"Premium DePIN:\n{data}")
 
-async def history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    u = await load_user(uid)
-    if tier_key(u["tier"]) == "free":
-        return await update.message.reply_text("Pro only. /upgrade to see chat history.")
-    hist = chat_history.get(uid, [])
-    if not hist: return await update.message.reply_text("No history yet.")
-    await update.message.reply_text("\n\n---\n\n".join(hist[-5:]))
+async def days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if uid in blocked_users:
+        return
+    left = await days_left(uid)
+    tier = await get_tier(uid)
+    if tier == "free":
+        await update.message.reply_text("You're on Free tier. /pay to upgrade.")
+    else:
+        await update.message.reply_text(f"{tier.title()} active. {left} days left.")
 
-# Admin commands
-async def adduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
-    if len(ctx.args)!= 2: return await update.message.reply_text("Usage: /adduser <user_id> <plan>")
-    target_uid, plan = ctx.args
-    if plan not in PLANS: return await update.message.reply_text("Invalid plan")
-    u = await load_user(target_uid)
-    expiry = int(time.time() + PLANS)
-    u["tier"] = f"pro_{expiry}"
-    await save_user(target_uid, u)
-    await update.message.reply_text(f"User {target_uid} activated for {plan}")
-    try: await ctx.bot.send_message(target_uid, f"✅ Pro activated for {plan}!")
-    except: pass
+async def pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if uid in blocked_users:
+        return
+    tier = await get_tier(uid)
+    if tier!= "free" and tier!= "admin":
+        await update.message.reply_text(f"You're {tier.title()}. Days left: {await days_left(uid)}")
+        return
+    if tier == "admin":
+        await update.message.reply_text("You have lifetime access.")
+        return
 
-async def extenduser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
-    if len(ctx.args)!= 2: return await update.message.reply_text("Usage: /extenduser <user_id> <plan>")
-    target_uid, plan = ctx.args
-    if plan not in PLANS: return await update.message.reply_text("Invalid plan")
-    u = await load_user(target_uid)
-    current_expiry = get_expiry(u["tier"])
-    new_expiry = max(int(time.time()), current_expiry) + PLANS
-    u["tier"] = f"pro_{new_expiry}"
-    await save_user(target_uid, u)
-    await update.message.reply_text(f"User {target_uid} extended for {plan}")
+    if not ctx.args:
+        msg = "Upgrade options:\n\n"
+        for t in ["pro", "premium"]:
+            msg += f"{t.title()}:\n"
+            for d, p in PRICES[t].items():
+                msg += f" {d}: ${p} USDT\n"
+        msg += f"\nSend to:\n`{USDT_WALLET}`\n"
+        msg += f"Then: /pay YOUR_TRON_ADDRESS pro 1m"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
 
-async def removeuser(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
-    if not ctx.args: return await update.message.reply_text("Usage: /removeuser <user_id>")
-    target_uid = ctx.args[0]
-    u = await load_user(target_uid)
-    u["tier"] = "free"
-    await save_user(target_uid, u)
-    await update.message.reply_text(f"User {target_uid} downgraded to free")
+    if len(ctx.args) < 3:
+        await update.message.reply_text("Usage: /pay YOUR_TRON_ADDRESS pro/premium 7d|1m|3m|6m")
+        return
 
-async def listusers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
-    try:
-        with open(USERS_FILE) as f: users = json.load(f)
-    except: users = {}
-    pro_count = sum(1 for u in users.values() if u["tier"]!= "free")
-    await update.message.reply_text(f"Total: {len(users)}\nPro/Premium: {pro_count}\nFree: {len(users)-pro_count}")
+    addr, plan, dur = ctx.args[0], ctx.args[1].lower(), ctx.args[2].lower()
+    if plan not in PRICES or dur not in PRICES:
+        await update.message.reply_text("Invalid plan or duration. Use: pro/premium + 7d/1m/3m/6m")
+        return
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("price", price))
-app.add_handler(CommandHandler("chat", chat))
-app.add_handler(CommandHandler("profile", profile))
-app.add_handler(CommandHandler("faq", faq))
-app.add_handler(CommandHandler("upgrade", upgrade))
-app.add_handler(CommandHandler("report", report))
-app.add_handler(CommandHandler("depin", depin))
-app.add_handler(CommandHandler("wallet", wallet))
-app.add_handler(CommandHandler("airdrop", airdrop))
-app.add_handler(CommandHandler("history", history))
-app.add_handler(CommandHandler("adduser", adduser))
-app.add_handler(CommandHandler("extenduser", extenduser))
-app.add_handler(CommandHandler("removeuser", removeuser))
-app.add_handler(CommandHandler("listusers", listusers))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
-app.add_handler(MessageHandler(filters.PHOTO, report))
+    price = PRICES[dur]
+    ctx.bot_data.setdefault("pending_payments", {})[uid] = {
+        "addr": addr, "tier": plan, "dur": dur, "price": price
+    }
+    await update.message.reply_text(f"Pending {plan.title()} {dur}. Send {price} USDT to activate.")
+
+# ===== ADMIN COMMANDS =====
+async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!= ADMIN_ID:
+        return
+    sub_count = get_sub_count()
+    pro_count = len([u for u in paid_users.values() if u["tier"] == "pro" and u["exp"] > time.time()])
+    prem_count = len([u for u in paid_users.values() if u["tier"] == "premium" and u["exp"] > time.time()])
+    blocked_count = len(blocked_users)
+    await update.message.reply_text(
+        f"📊 Bot Stats:\n"
+        f"Active subs: {sub_count}\n"
+        f"Pro: {pro_count}\n"
+        f"Premium: {prem_count}\n"
+        f"Blocked: {blocked_count}"
+    )
+
+async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!= ADMIN_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /broadcast Your announcement message")
+        return
+    msg = " ".join(ctx.args)
+    now = time.time()
+    sent = 0
+    for uid, data in paid_users.items():
+        if data["exp"] > now:
+            try:
+                await ctx.bot.send_message(chat_id=int(uid), text=f"📢 Announcement:\n\n{msg}")
+                sent += 1
+            except:
+                pass
+    await update.message.reply_text(f"Broadcast sent to {sent} active subscribers.")
+
+async def refstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!= ADMIN_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /refstats USER_ID")
+        return
+    target = ctx.args[0]
+    hours = ref_cache.get(target, 0)
+    ref_list = referrals.get(target, [])
+    await update.message.reply_text(
+        f"User {target}:\n"
+        f"Referral hours: {hours}h\n"
+        f"Referred users: {len(ref_list)}"
+    )
+
+async def add_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!= ADMIN_ID:
+        return
+    if len(ctx.args) < 3:
+        await update.message.reply_text("Usage: /add_paid USER_ID pro/premium 7d|1m|3m|6m")
+        return
+    uid, tier, dur = ctx.args[0], ctx.args[1].lower(), ctx.args[2].lower()
+    if tier not in PRICES or dur not in PRICES:
+        await update.message.reply_text("Invalid tier or duration")
+        return
+    days = DAYS[dur]
+    paid_users[uid] = {"tier": tier, "exp": time.time() + days * 86400}
+    await update.message.reply_text(f"Added {uid} to {tier.title()} {dur}")
+
+async def remove_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!= ADMIN_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /remove_paid USER_ID")
+        return
+    uid = ctx.args[0]
+    if uid in paid_users:
+        del paid_users[uid]
+        await update.message.reply_text(f"Removed {uid} from paid users.")
+    else:
+        await update.message.reply_text(f"{uid} not found in paid users.")
+
+async def block(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!= ADMIN_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /block USER_ID")
+        return
+    blocked_users.add(ctx.args[0])
+    await update.message.reply_text(f"Blocked {ctx.args[0]}")
+
+async def unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!= ADMIN_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /unblock USER_ID")
+        return
+    blocked_users.discard(ctx.args[0])
+    await update.message.reply_text(f"Unblocked {ctx.args[0]}")
+
+async def list_blocked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!= ADMIN_ID:
+        return
+    if not blocked_users:
+        await update.message.reply_text("No blocked users.")
+    else:
+        await update.message.reply_text("Blocked users:\n" + "\n".join(blocked_users))
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("depin", depin))
+    app.add_handler(CommandHandler("days", days))
+    app.add_handler(CommandHandler("pay", pay))
+
+    # Admin commands
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("refstats", refstats))
+    app.add_handler(CommandHandler("add_paid", add_paid))
+    app.add_handler(CommandHandler("remove_paid", remove_paid))
+    app.add_handler(CommandHandler("block", block))
+    app.add_handler(CommandHandler("unblock", unblock))
+    app.add_handler(CommandHandler("list_blocked", list_blocked))
+
+    app.job_queue.run_repeating(lambda ctx: check_payments(app), interval=30, first=5)
+    print("Bot running...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    app.run_polling()
+    main()
