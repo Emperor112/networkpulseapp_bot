@@ -1,6 +1,6 @@
-import os, time, asyncio, aiohttp
+import os, time, asyncio, aiohttp, traceback
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -123,6 +123,25 @@ async def check_payments(app):
                             del app.bot_data["pending_payments"][uid]
     except Exception as e:
         print(f"Payment check error: {e}")
+        if ADMIN_ID:
+            try:
+                await app.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Payment check error:\n{e}")
+            except:
+                pass
+
+# ===== ERROR HANDLER =====
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
+    print(f"Error: {err}")
+    if ADMIN_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"⚠️ Bot error:\n```{err[:3500]}```",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
 
 # ===== USER COMMANDS =====
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -228,11 +247,11 @@ async def pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     addr, plan, dur = ctx.args[0], ctx.args[1].lower(), ctx.args[2].lower()
-    if plan not in PRICES or dur not in PRICES:
+    if plan not in PRICES or dur not in PRICES[plan]:
         await update.message.reply_text("Invalid plan or duration. Use: pro/premium + 7d/1m/3m/6m")
         return
 
-    price = PRICES[dur]
+    price = PRICES[plan][dur]
     ctx.bot_data.setdefault("pending_payments", {})[uid] = {
         "addr": addr, "tier": plan, "dur": dur, "price": price
     }
@@ -294,7 +313,7 @@ async def add_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /add_paid USER_ID pro/premium 7d|1m|3m|6m")
         return
     uid, tier, dur = ctx.args[0], ctx.args[1].lower(), ctx.args[2].lower()
-    if tier not in PRICES or dur not in PRICES:
+    if tier not in PRICES or dur not in PRICES[tier]:
         await update.message.reply_text("Invalid tier or duration")
         return
     days = DAYS[dur]
@@ -341,7 +360,13 @@ async def list_blocked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Blocked users:\n" + "\n".join(blocked_users))
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    if not BOT_TOKEN:
+        print("ERROR: BOT_TOKEN not set")
+        return
+
+    app = Application.builder().token(BOT_TOKEN).job_queue(JobQueue()).build()
+    app.add_error_handler(error_handler)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("depin", depin))
@@ -358,9 +383,11 @@ def main():
     app.add_handler(CommandHandler("unblock", unblock))
     app.add_handler(CommandHandler("list_blocked", list_blocked))
 
+    # Payment checker every 30s
     app.job_queue.run_repeating(lambda ctx: check_payments(app), interval=30, first=5)
+
     print("Bot running...")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
