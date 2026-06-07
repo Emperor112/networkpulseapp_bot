@@ -1,6 +1,17 @@
-import os, time, asyncio, aiohttp, traceback
+import os, time, asyncio, aiohttp, traceback, threading
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
+from flask import Flask
+
+# ===== FLASK KEEP-ALIVE FOR RENDER FREE TIER =====
+app_flask = Flask(__name__)
+
+@app_flask.route('/')
+def home():
+    return "Bot running"
+
+def run_flask():
+    app_flask.run(host='0.0.0.0', port=int(os.getenv('PORT', 10000)))
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -385,6 +396,9 @@ def main():
 
     # Payment checker every 30s
     app.job_queue.run_repeating(lambda ctx: check_payments(app), interval=30, first=5)
+
+    # Start Flask so Render Web Service stays alive
+    threading.Thread(target=run_flask, daemon=True).start()
 
     print("Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
