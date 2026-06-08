@@ -1,17 +1,8 @@
-import os, time, asyncio, aiohttp, traceback, threading
+import os, time, asyncio, aiohttp, traceback
+from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
-from flask import Flask
-
-# ===== FLASK KEEP-ALIVE FOR RENDER FREE TIER =====
-app_flask = Flask(__name__)
-
-@app_flask.route('/')
-def home():
-    return "Bot running"
-
-def run_flask():
-    app_flask.run(host='0.0.0.0', port=int(os.getenv('PORT', 10000)))
+from aiohttp import web
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -20,10 +11,19 @@ TRON_PRO_API_KEY = os.getenv("TRON_PRO_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
+AD_LINK = "https://www.effectivecpmnetwork.com/ji8uxqectz?key=37cc2a32d07742c3b5215d602c8ab056"
+PROMO_PRICE_USDT = 2.99
+
 TRON_USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 CACHE_TTL = 60
 
-# Pricing
+LIMITS = {
+    "free": {"base": 3, "per_ad": 3, "max_ads": 5},
+    "pro": {"base": 50, "per_ad": 0, "max_ads": 0},
+    "premium": {"base": 150, "per_ad": 0, "max_ads": 0},
+    "admin": {"base": 999, "per_ad": 0, "max_ads": 0}
+}
+
 PRICES = {
     "pro": {"7d": 0.99, "1m": 2.99, "3m": 6.99, "6m": 12.99},
     "premium": {"7d": 1.99, "1m": 4.99, "3m": 11.99, "6m": 21.99}
@@ -38,8 +38,22 @@ referrals = {}
 ref_cache = {}
 price_cache = {"data": None, "ts": 0}
 depin_cache = {"data": None, "ts": 0}
+promo_slots = {}
+
+user_usage = {}
 
 # ===== HELPERS =====
+def get_today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def get_user_state(uid):
+    today = get_today()
+    state = user_usage.get(uid, {"date": today, "msgs_used": 0, "ads_watched": 0})
+    if state["date"]!= today:
+        state = {"date": today, "msgs_used": 0, "ads_watched": 0}
+        user_usage[uid] = state
+    return state
+
 async def get_tier(uid):
     if str(uid) == str(ADMIN_ID):
         return "admin"
@@ -50,13 +64,31 @@ async def get_tier(uid):
         return "free"
     return data["tier"]
 
-async def is_pro(uid):
+async def can_use_feature(uid):
+    if str(uid) in blocked_users:
+        return False, "blocked"
     tier = await get_tier(uid)
-    return tier in ["pro", "premium", "admin"] and str(uid) not in blocked_users
+    limit = LIMITS
+    state = get_user_state(uid)
+    max_msgs = limit["base"] + state["ads_watched"] * limit["per_ad"]
+    if state["msgs_used"] < max_msgs:
+        state["msgs_used"] += 1
+        user_usage[uid] = state
+        return True, None
+    if tier == "free" and state["ads_watched"] < limit["max_ads"]:
+        return False, "ad_required"
+    return False, "limit_reached"
 
-async def is_premium(uid):
+async def watch_ad(uid):
     tier = await get_tier(uid)
-    return tier in ["premium", "admin"] and str(uid) not in blocked_users
+    limit = LIMITS
+    state = get_user_state(uid)
+    if state["ads_watched"] >= limit["max_ads"]:
+        return False
+    state["ads_watched"] += 1
+    state["msgs_used"] += limit["per_ad"]
+    user_usage[uid] = state
+    return True
 
 async def days_left(uid):
     if str(uid) == str(ADMIN_ID):
@@ -81,18 +113,14 @@ async def get_groq_prices(prompt):
     if not GROQ_API_KEY:
         return "Groq API key not set"
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "llama-3.1-8b-instant",
         "messages": [
             {"role": "system", "content": "Return only current crypto prices and 24h % change. Format: SYMBOL: $price +x.x%"},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.1,
-        "max_tokens": 300
+        "temperature": 0.1, "max_tokens": 300
     }
     try:
         async with aiohttp.ClientSession() as s:
@@ -103,6 +131,19 @@ async def get_groq_prices(prompt):
                 return data["choices"][0]["message"]["content"].strip()
     except:
         return None
+
+async def broadcast_promo(app, link):
+    now = time.time()
+    sent = 0
+    for uid, data in paid_users.items():
+        if data["exp"] > now:
+            try:
+                await app.bot.send_message(chat_id=int(uid), text=f"📢 Sponsored:\n{link}")
+                sent += 1
+            except:
+                pass
+    if ADMIN_ID:
+        await app.bot.send_message(chat_id=ADMIN_ID, text=f"Promo broadcasted to {sent} users:\n{link}")
 
 async def check_payments(app):
     if not TRON_PRO_API_KEY or not USDT_WALLET:
@@ -120,18 +161,21 @@ async def check_payments(app):
                     for uid, pending in list(app.bot_data.get("pending_payments", {}).items()):
                         if pending["addr"] == from_addr and value >= pending["price"]:
                             days = DAYS[pending["dur"]]
-                            paid_users[uid] = {
-                                "tier": pending["tier"],
-                                "exp": time.time() + days * 86400
-                            }
+                            paid_users[uid] = {"tier": pending["tier"], "exp": time.time() + days * 86400}
                             try:
-                                await app.bot.send_message(
-                                    chat_id=int(uid),
-                                    text=f"✅ {pending['tier'].title()} {pending['dur']} activated for {days} days."
-                                )
+                                await app.bot.send_message(chat_id=int(uid), text=f"✅ {pending['tier'].title()} {pending['dur']} activated for {days} days.\nDaily limit: {LIMITS[pending['tier']]['base']} msgs/day")
                             except:
                                 pass
                             del app.bot_data["pending_payments"][uid]
+                    for uid, pending in list(app.bot_data.get("pending_promo", {}).items()):
+                        if value >= pending["price"]:
+                            promo_slots[uid] = {"link": pending["link"], "exp": time.time() + 86400}
+                            try:
+                                await app.bot.send_message(chat_id=int(uid), text=f"✅ Promo activated for 24h!")
+                                await broadcast_promo(app, pending["link"])
+                            except:
+                                pass
+                            del app.bot_data["pending_promo"][uid]
     except Exception as e:
         print(f"Payment check error: {e}")
         if ADMIN_ID:
@@ -140,17 +184,22 @@ async def check_payments(app):
             except:
                 pass
 
+# ===== WEBHOOK FOR VERCEL =====
+async def webhook_handler(request):
+    data = await request.json()
+    link = data.get("link")
+    if link and app:
+        await broadcast_promo(app, link)
+        return web.json_response({"ok": True})
+    return web.json_response({"ok": False}, status=400)
+
 # ===== ERROR HANDLER =====
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
     print(f"Error: {err}")
     if ADMIN_ID:
         try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=f"⚠️ Bot error:\n```{err[:3500]}```",
-                parse_mode="Markdown"
-            )
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Bot error:\n```{err[:3500]}```", parse_mode="Markdown")
         except:
             pass
 
@@ -165,27 +214,34 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             referrals.setdefault(uid, []).append(ref)
             ref_cache[ref] = ref_cache.get(ref, 0) + 12
     tier = await get_tier(uid)
-    await update.message.reply_text(
-        f"Welcome! Tier: {tier.title()}\n"
-        f"Free: /price\n"
-        f"Pro/Premium: /pay to upgrade\n"
-        f"Check sub: /days\n"
-        f"Refer: share your ID {uid} for +12h per referral"
-    )
+    limit = LIMITS
+    await update.message.reply_text(f"Welcome! Tier: {tier.title()}\nDaily limit: {limit['base']} msgs\nCommands:\n/price - Crypto prices\n/depin - DePIN tokens\n/days - Check usage\n/pay - Upgrade\n/promote - Advertise your link")
 
 async def price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    if uid in blocked_users:
-        return
-
+    can_use, reason = await can_use_feature(uid)
     tier = await get_tier(uid)
     now = time.time()
-
+    if not can_use:
+        if reason == "ad_required":
+            await update.message.reply_text(f"⚠️ Daily limit reached.\nWatch an ad for +3 messages:\n{AD_LINK}\n\nAfter watching, type /watched to unlock.")
+            return
+        elif reason == "limit_reached":
+            await update.message.reply_text(f"❌ Daily limit reached.\n/pay to upgrade your tier")
+            return
+        else:
+            return
+    state = get_user_state(uid)
+    limit = LIMITS
+    max_msgs = limit["base"] + state["ads_watched"] * limit["per_ad"]
+    remaining = max_msgs - state["msgs_used"]
     if tier == "free":
         data = "BTC: $67,234 +2.1%\nETH: $3,412 +1.8%\nSOL: $152 +3.5%\nBNB: $585 +0.9%\nXRP: $0.52 +1.2%"
-        await update.message.reply_text(f"Free - Top 5:\n{data}\n\n/pay to unlock full data + DePIN")
+        msg = f"Free - Top 5:\n{data}"
+        if remaining <= 5:
+            msg += f"\n\n⚠️ {remaining} msgs left today"
+        await update.message.reply_text(msg)
         return
-
     if price_cache["data"] and now - price_cache["ts"] < CACHE_TTL:
         data = price_cache["data"]
     else:
@@ -195,17 +251,21 @@ async def price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             price_cache["data"] = data
             price_cache["ts"] = now
-
-    await update.message.reply_text(f"{tier.title()} Data:\n{data}")
+    msg = f"{tier.title()} Data:\n{data}"
+    if remaining <= 5 and tier!= "admin":
+        msg += f"\n\n⚠️ {remaining} msgs left today"
+    await update.message.reply_text(msg)
 
 async def depin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    if uid in blocked_users:
+    tier = await get_tier(uid)
+    if tier == "free":
+        await update.message.reply_text("DePIN is Premium only. /pay to upgrade.")
         return
-    if not await is_premium(uid):
-        await update.message.reply_text("DePIN tracker is Premium only. /pay to upgrade.")
+    can_use, reason = await can_use_feature(uid)
+    if not can_use:
+        await update.message.reply_text("❌ Daily limit reached.\n/pay to upgrade your tier")
         return
-
     now = time.time()
     if depin_cache["data"] and now - depin_cache["ts"] < CACHE_TTL:
         data = depin_cache["data"]
@@ -216,19 +276,37 @@ async def depin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             depin_cache["data"] = data
             depin_cache["ts"] = now
+    state = get_user_state(uid)
+    limit = LIMITS
+    max_msgs = limit["base"] + state["ads_watched"] * limit["per_ad"]
+    remaining = max_msgs - state["msgs_used"]
+    msg = f"Premium DePIN:\n{data}"
+    if remaining <= 5 and tier!= "admin":
+        msg += f"\n\n⚠️ {remaining} msgs left today"
+    await update.message.reply_text(msg)
 
-    await update.message.reply_text(f"Premium DePIN:\n{data}")
+async def watched(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    tier = await get_tier(uid)
+    if tier!= "free":
+        await update.message.reply_text("You have unlimited access, no ads needed.")
+        return
+    success = await watch_ad(uid)
+    if success:
+        state = get_user_state(uid)
+        limit = LIMITS
+        await update.message.reply_text(f"✅ +3 messages unlocked!\nAds watched today: {state['ads_watched']}/{limit['max_ads']}")
+    else:
+        await update.message.reply_text(f"❌ Max ads watched today: {LIMITS['free']['max_ads']}")
 
 async def days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    if uid in blocked_users:
-        return
     left = await days_left(uid)
     tier = await get_tier(uid)
-    if tier == "free":
-        await update.message.reply_text("You're on Free tier. /pay to upgrade.")
-    else:
-        await update.message.reply_text(f"{tier.title()} active. {left} days left.")
+    state = get_user_state(uid)
+    limit = LIMITS
+    max_msgs = limit["base"] + state["ads_watched"] * limit["per_ad"]
+    await update.message.reply_text(f"Tier: {tier.title()}\nMessages: {state['msgs_used']}/{max_msgs}\nAds watched: {state['ads_watched']}/{limit['max_ads']}\nDays left: {left if tier!= 'free' else 'N/A'}")
 
 async def pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
@@ -241,32 +319,50 @@ async def pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if tier == "admin":
         await update.message.reply_text("You have lifetime access.")
         return
-
     if not ctx.args:
         msg = "Upgrade options:\n\n"
         for t in ["pro", "premium"]:
-            msg += f"{t.title()}:\n"
+            msg += f"{t.title()} - {LIMITS[t]['base']} msgs/day:\n"
             for d, p in PRICES[t].items():
                 msg += f" {d}: ${p} USDT\n"
-        msg += f"\nSend to:\n`{USDT_WALLET}`\n"
-        msg += f"Then: /pay YOUR_TRON_ADDRESS pro 1m"
+        msg += f"\nSend to:\n`{USDT_WALLET}`\nThen: /pay YOUR_TRON_ADDRESS pro 1m"
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
-
     if len(ctx.args) < 3:
         await update.message.reply_text("Usage: /pay YOUR_TRON_ADDRESS pro/premium 7d|1m|3m|6m")
         return
-
     addr, plan, dur = ctx.args[0], ctx.args[1].lower(), ctx.args[2].lower()
-    if plan not in PRICES or dur not in PRICES[plan]:
+    if plan not in PRICES or dur not in PRICES:
         await update.message.reply_text("Invalid plan or duration. Use: pro/premium + 7d/1m/3m/6m")
         return
-
-    price = PRICES[plan][dur]
-    ctx.bot_data.setdefault("pending_payments", {})[uid] = {
-        "addr": addr, "tier": plan, "dur": dur, "price": price
-    }
+    price = PRICES[dur]
+    ctx.bot_data.setdefault("pending_payments", {})[uid] = {"addr": addr, "tier": plan, "dur": dur, "price": price}
     await update.message.reply_text(f"Pending {plan.title()} {dur}. Send {price} USDT to activate.")
+
+async def promote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if uid in blocked_users:
+        return
+    if not ctx.args:
+        await update.message.reply_text(f"📢 Promote your channel/link to all active users\nPrice: {PROMO_PRICE_USDT} USDT for 24 hours\nUsage: /promote YOUR_LINK\nThen send {PROMO_PRICE_USDT} USDT to:\n`{USDT_WALLET}`\nYour promo goes live after payment.", parse_mode="Markdown")
+        return
+    link = ctx.args[0]
+    ctx.bot_data.setdefault("pending_promo", {})[uid] = {"link": link, "price": PROMO_PRICE_USDT}
+    await update.message.reply_text(f"Pending promo for:\n{link}\n\nSend {PROMO_PRICE_USDT} USDT to activate for 24h.")
+
+async def mypromo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    slot = promo_slots.get(uid)
+    if not slot:
+        await update.message.reply_text("You have no active promo.")
+        return
+    time_left = max(0, int(slot["exp"] - time.time()))
+    hours_left = time_left // 3600
+    if time_left <= 0:
+        del promo_slots[uid]
+        await update.message.reply_text("Your promo has expired.")
+        return
+    await update.message.reply_text(f"Active promo:\n{slot['link']}\nTime left: {hours_left}h")
 
 # ===== ADMIN COMMANDS =====
 async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -276,13 +372,7 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pro_count = len([u for u in paid_users.values() if u["tier"] == "pro" and u["exp"] > time.time()])
     prem_count = len([u for u in paid_users.values() if u["tier"] == "premium" and u["exp"] > time.time()])
     blocked_count = len(blocked_users)
-    await update.message.reply_text(
-        f"📊 Bot Stats:\n"
-        f"Active subs: {sub_count}\n"
-        f"Pro: {pro_count}\n"
-        f"Premium: {prem_count}\n"
-        f"Blocked: {blocked_count}"
-    )
+    await update.message.reply_text(f"📊 Bot Stats:\nActive subs: {sub_count}\nPro: {pro_count}\nPremium: {prem_count}\nBlocked: {blocked_count}")
 
 async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id!= ADMIN_ID:
@@ -311,11 +401,7 @@ async def refstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     target = ctx.args[0]
     hours = ref_cache.get(target, 0)
     ref_list = referrals.get(target, [])
-    await update.message.reply_text(
-        f"User {target}:\n"
-        f"Referral hours: {hours}h\n"
-        f"Referred users: {len(ref_list)}"
-    )
+    await update.message.reply_text(f"User {target}:\nReferral hours: {hours}h\nReferred users: {len(ref_list)}")
 
 async def add_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id!= ADMIN_ID:
@@ -324,7 +410,7 @@ async def add_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /add_paid USER_ID pro/premium 7d|1m|3m|6m")
         return
     uid, tier, dur = ctx.args[0], ctx.args[1].lower(), ctx.args[2].lower()
-    if tier not in PRICES or dur not in PRICES[tier]:
+    if tier not in PRICES or dur not in PRICES:
         await update.message.reply_text("Invalid tier or duration")
         return
     days = DAYS[dur]
@@ -370,7 +456,10 @@ async def list_blocked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Blocked users:\n" + "\n".join(blocked_users))
 
-def main():
+app = None
+
+async def main():
+    global app
     if not BOT_TOKEN:
         print("ERROR: BOT_TOKEN not set")
         return
@@ -383,8 +472,9 @@ def main():
     app.add_handler(CommandHandler("depin", depin))
     app.add_handler(CommandHandler("days", days))
     app.add_handler(CommandHandler("pay", pay))
-
-    # Admin commands
+    app.add_handler(CommandHandler("watched", watched))
+    app.add_handler(CommandHandler("promote", promote))
+    app.add_handler(CommandHandler("mypromo", mypromo))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("refstats", refstats))
@@ -394,14 +484,17 @@ def main():
     app.add_handler(CommandHandler("unblock", unblock))
     app.add_handler(CommandHandler("list_blocked", list_blocked))
 
-    # Payment checker every 30s
     app.job_queue.run_repeating(lambda ctx: check_payments(app), interval=30, first=5)
 
-    # Start Flask so Render Web Service stays alive
-    threading.Thread(target=run_flask, daemon=True).start()
+    # Start web server for Vercel webhook
+    runner = web.AppRunner(web.Application())
+    runner.app.router.add_post("/webhook/promo", webhook_handler)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
+    await site.start()
 
-    print("Bot running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("Bot + Webhook running...")
+    await app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
