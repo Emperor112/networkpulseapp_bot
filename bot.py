@@ -486,7 +486,7 @@ async def main():
 
     app.job_queue.run_repeating(lambda ctx: check_payments(app), interval=30, first=5)
 
-    # Start web server for Vercel webhook
+    # Start aiohttp web server
     runner = web.AppRunner(web.Application())
     runner.app.router.add_post("/webhook/promo", webhook_handler)
     await runner.setup()
@@ -494,7 +494,10 @@ async def main():
     await site.start()
 
     print("Bot + Webhook running...")
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Run bot polling - this blocks forever
+    await app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
