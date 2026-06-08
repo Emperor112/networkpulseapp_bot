@@ -482,3 +482,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+print("Registered handlers:", [h.command for h in app.handlers[0] if hasattr(h, 'command')])
