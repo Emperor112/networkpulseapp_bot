@@ -2,7 +2,6 @@ import os, time, asyncio, aiohttp, traceback
 from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
-from aiohttp import web
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -39,8 +38,9 @@ ref_cache = {}
 price_cache = {"data": None, "ts": 0}
 depin_cache = {"data": None, "ts": 0}
 promo_slots = {}
-
 user_usage = {}
+
+app = None # global ref for check_payments
 
 # ===== HELPERS =====
 def get_today():
@@ -68,7 +68,7 @@ async def can_use_feature(uid):
     if str(uid) in blocked_users:
         return False, "blocked"
     tier = await get_tier(uid)
-    limit = LIMITS
+    limit = LIMITS[tier]
     state = get_user_state(uid)
     max_msgs = limit["base"] + state["ads_watched"] * limit["per_ad"]
     if state["msgs_used"] < max_msgs:
@@ -81,7 +81,7 @@ async def can_use_feature(uid):
 
 async def watch_ad(uid):
     tier = await get_tier(uid)
-    limit = LIMITS
+    limit = LIMITS[tier]
     state = get_user_state(uid)
     if state["ads_watched"] >= limit["max_ads"]:
         return False
@@ -132,7 +132,7 @@ async def get_groq_prices(prompt):
     except:
         return None
 
-async def broadcast_promo(app, link):
+async def broadcast_promo(link):
     now = time.time()
     sent = 0
     for uid, data in paid_users.items():
@@ -145,7 +145,7 @@ async def broadcast_promo(app, link):
     if ADMIN_ID:
         await app.bot.send_message(chat_id=ADMIN_ID, text=f"Promo broadcasted to {sent} users:\n{link}")
 
-async def check_payments(app):
+async def check_payments(context):
     if not TRON_PRO_API_KEY or not USDT_WALLET:
         return
     url = f"https://api.trongrid.io/v1/accounts/{USDT_WALLET}/transactions/trc20"
@@ -172,7 +172,7 @@ async def check_payments(app):
                             promo_slots[uid] = {"link": pending["link"], "exp": time.time() + 86400}
                             try:
                                 await app.bot.send_message(chat_id=int(uid), text=f"✅ Promo activated for 24h!")
-                                await broadcast_promo(app, pending["link"])
+                                await broadcast_promo(pending["link"])
                             except:
                                 pass
                             del app.bot_data["pending_promo"][uid]
@@ -183,15 +183,6 @@ async def check_payments(app):
                 await app.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Payment check error:\n{e}")
             except:
                 pass
-
-# ===== WEBHOOK FOR VERCEL =====
-async def webhook_handler(request):
-    data = await request.json()
-    link = data.get("link")
-    if link and app:
-        await broadcast_promo(app, link)
-        return web.json_response({"ok": True})
-    return web.json_response({"ok": False}, status=400)
 
 # ===== ERROR HANDLER =====
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -214,7 +205,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             referrals.setdefault(uid, []).append(ref)
             ref_cache[ref] = ref_cache.get(ref, 0) + 12
     tier = await get_tier(uid)
-    limit = LIMITS
+    limit = LIMITS[tier]
     await update.message.reply_text(f"Welcome! Tier: {tier.title()}\nDaily limit: {limit['base']} msgs\nCommands:\n/price - Crypto prices\n/depin - DePIN tokens\n/days - Check usage\n/pay - Upgrade\n/promote - Advertise your link")
 
 async def price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -232,7 +223,7 @@ async def price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             return
     state = get_user_state(uid)
-    limit = LIMITS
+    limit = LIMITS[tier]
     max_msgs = limit["base"] + state["ads_watched"] * limit["per_ad"]
     remaining = max_msgs - state["msgs_used"]
     if tier == "free":
@@ -277,7 +268,7 @@ async def depin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             depin_cache["data"] = data
             depin_cache["ts"] = now
     state = get_user_state(uid)
-    limit = LIMITS
+    limit = LIMITS[tier]
     max_msgs = limit["base"] + state["ads_watched"] * limit["per_ad"]
     remaining = max_msgs - state["msgs_used"]
     msg = f"Premium DePIN:\n{data}"
@@ -294,7 +285,7 @@ async def watched(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     success = await watch_ad(uid)
     if success:
         state = get_user_state(uid)
-        limit = LIMITS
+        limit = LIMITS[tier]
         await update.message.reply_text(f"✅ +3 messages unlocked!\nAds watched today: {state['ads_watched']}/{limit['max_ads']}")
     else:
         await update.message.reply_text(f"❌ Max ads watched today: {LIMITS['free']['max_ads']}")
@@ -304,7 +295,7 @@ async def days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     left = await days_left(uid)
     tier = await get_tier(uid)
     state = get_user_state(uid)
-    limit = LIMITS
+    limit = LIMITS[tier]
     max_msgs = limit["base"] + state["ads_watched"] * limit["per_ad"]
     await update.message.reply_text(f"Tier: {tier.title()}\nMessages: {state['msgs_used']}/{max_msgs}\nAds watched: {state['ads_watched']}/{limit['max_ads']}\nDays left: {left if tier!= 'free' else 'N/A'}")
 
@@ -332,10 +323,10 @@ async def pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /pay YOUR_TRON_ADDRESS pro/premium 7d|1m|3m|6m")
         return
     addr, plan, dur = ctx.args[0], ctx.args[1].lower(), ctx.args[2].lower()
-    if plan not in PRICES or dur not in PRICES:
+    if plan not in PRICES or dur not in PRICES[plan]:
         await update.message.reply_text("Invalid plan or duration. Use: pro/premium + 7d/1m/3m/6m")
         return
-    price = PRICES[dur]
+    price = PRICES[plan][dur]
     ctx.bot_data.setdefault("pending_payments", {})[uid] = {"addr": addr, "tier": plan, "dur": dur, "price": price}
     await update.message.reply_text(f"Pending {plan.title()} {dur}. Send {price} USDT to activate.")
 
@@ -410,7 +401,7 @@ async def add_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /add_paid USER_ID pro/premium 7d|1m|3m|6m")
         return
     uid, tier, dur = ctx.args[0], ctx.args[1].lower(), ctx.args[2].lower()
-    if tier not in PRICES or dur not in PRICES:
+    if tier not in PRICES or dur not in PRICES[tier]:
         await update.message.reply_text("Invalid tier or duration")
         return
     days = DAYS[dur]
@@ -448,14 +439,7 @@ async def unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     blocked_users.discard(ctx.args[0])
     await update.message.reply_text(f"Unblocked {ctx.args[0]}")
 
-async def start_webserver():
-    runner = web.AppRunner(web.Application())
-    runner.app.router.add_post("/webhook/promo", webhook_handler)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
-    await site.start()
-    print("Webhook running on port", os.getenv("PORT", 10000))
-
+# ===== MAIN =====
 def main():
     global app
     if not BOT_TOKEN:
@@ -465,21 +449,29 @@ def main():
     app = Application.builder().token(BOT_TOKEN).job_queue(JobQueue()).build()
     app.add_error_handler(error_handler)
 
-    # add all your handlers here...
+    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))
-    # ...rest of handlers
+    app.add_handler(CommandHandler("depin", depin))
+    app.add_handler(CommandHandler("days", days))
+    app.add_handler(CommandHandler("pay", pay))
+    app.add_handler(CommandHandler("watched", watched))
+    app.add_handler(CommandHandler("promote", promote))
+    app.add_handler(CommandHandler("mypromo", mypromo))
 
-    app.job_queue.run_repeating(lambda ctx: check_payments(app), interval=30, first=5)
+    # Admin commands
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("refstats", refstats))
+    app.add_handler(CommandHandler("add_paid", add_paid))
+    app.add_handler(CommandHandler("remove_paid", remove_paid))
+    app.add_handler(CommandHandler("block", block))
+    app.add_handler(CommandHandler("unblock", unblock))
 
-    # Start web server in background
-    loop = asyncio.get_event_loop()
-    loop.create_task(start_webserver())
+    app.job_queue.run_repeating(check_payments, interval=30, first=5)
 
-    print("Bot + Webhook running...")
-    # PTB handles its own loop now
-    app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+    print("Bot running with all features...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-print("Registered handlers:", [h.command for h in app.handlers[0] if hasattr(h, 'command')])
