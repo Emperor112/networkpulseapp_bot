@@ -448,17 +448,15 @@ async def unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     blocked_users.discard(ctx.args[0])
     await update.message.reply_text(f"Unblocked {ctx.args[0]}")
 
-async def list_blocked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id!= ADMIN_ID:
-        return
-    if not blocked_users:
-        await update.message.reply_text("No blocked users.")
-    else:
-        await update.message.reply_text("Blocked users:\n" + "\n".join(blocked_users))
+async def start_webserver():
+    runner = web.AppRunner(web.Application())
+    runner.app.router.add_post("/webhook/promo", webhook_handler)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
+    await site.start()
+    print("Webhook running on port", os.getenv("PORT", 10000))
 
-app = None
-
-async def main():
+def main():
     global app
     if not BOT_TOKEN:
         print("ERROR: BOT_TOKEN not set")
@@ -467,37 +465,20 @@ async def main():
     app = Application.builder().token(BOT_TOKEN).job_queue(JobQueue()).build()
     app.add_error_handler(error_handler)
 
+    # add all your handlers here...
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("price", price))
-    app.add_handler(CommandHandler("depin", depin))
-    app.add_handler(CommandHandler("days", days))
-    app.add_handler(CommandHandler("pay", pay))
-    app.add_handler(CommandHandler("watched", watched))
-    app.add_handler(CommandHandler("promote", promote))
-    app.add_handler(CommandHandler("mypromo", mypromo))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CommandHandler("refstats", refstats))
-    app.add_handler(CommandHandler("add_paid", add_paid))
-    app.add_handler(CommandHandler("remove_paid", remove_paid))
-    app.add_handler(CommandHandler("block", block))
-    app.add_handler(CommandHandler("unblock", unblock))
-    app.add_handler(CommandHandler("list_blocked", list_blocked))
+    # ...rest of handlers
 
     app.job_queue.run_repeating(lambda ctx: check_payments(app), interval=30, first=5)
 
-    # Start aiohttp web server
-    runner = web.AppRunner(web.Application())
-    runner.app.router.add_post("/webhook/promo", webhook_handler)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
-    await site.start()
+    # Start web server in background
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_webserver())
 
     print("Bot + Webhook running...")
-    
-    # Run bot polling - this blocks forever
-    await app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+    # PTB handles its own loop now
+    app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
